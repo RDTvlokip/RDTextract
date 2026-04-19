@@ -20,7 +20,7 @@ pip install RDTextract
 ```python
 import rdtextract
 
-html = open("page.html").read()
+html = open("page.html", encoding="utf-8", errors="replace").read()
 
 # One-shot
 markdown = rdtextract.extract(html)
@@ -31,7 +31,11 @@ markdown = rdtextract.to_markdown(cleaned)
 
 # Filter low-value pages before writing to your corpus
 if not rdtextract.is_low_value_stub(markdown):
-    save(markdown)
+    with open("page.md", "w", encoding="utf-8") as f:
+        f.write(markdown)
+    print(f"Saved {len(markdown)} chars to page.md")
+else:
+    print("Page is low-value (paywall/login/empty), skipped.")
 ```
 
 > **Note** : PyPI distribution is `RDTextract`, Python module is `rdtextract` (PEP 8 lowercase).

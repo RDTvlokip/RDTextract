@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "RDTextract"
+version = "0.1.0"
+description = "HTML→Markdown extractor optimized for LLM training corpora — zero noise artifacts, integrated quality scoring, low-value stub detection."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Théo CHARLET", email = "contact@rdtvlokip.fr" },
+]
+keywords = ["html", "markdown", "extraction", "llm", "training", "corpus", "scraping", "nlp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Markup :: HTML",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "beautifulsoup4>=4.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+benchmark = [
+    "trafilatura",
+    "markdownify",
+    "html2text",
+]
+
+[project.urls]
+Homepage = "https://github.com/RDTvlokip/RDTextract"
+Repository = "https://github.com/RDTvlokip/RDTextract"
+Issues = "https://github.com/RDTvlokip/RDTextract/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rdtextract*"]
+exclude = ["tests*", "benchmark*"]

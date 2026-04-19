@@ -1,5 +1,9 @@
 # RDTextract
 
+[![PyPI](https://img.shields.io/pypi/v/RDTextract)](https://pypi.org/project/RDTextract/)
+[![Python](https://img.shields.io/pypi/pyversions/RDTextract)](https://pypi.org/project/RDTextract/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 HTML→Markdown extractor built for **AI / LLM training corpora** — every byte should carry signal, not boilerplate.
 
 > **Language scope (current):** filters, paywall markers, and the `is_low_value_stub()` heuristic are tuned for **French** content (the corpus this lib was extracted from is FR-only). Core extraction is language-agnostic and works on any language; only the stub detector is FR-specific. Multi-language support is on the roadmap.

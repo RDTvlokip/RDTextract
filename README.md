@@ -44,7 +44,7 @@ Benchmark on **Tranco top-1000 .fr** homepages (672 pages successfully fetched a
 
 | Extractor       | Quality (corrected) | double-bullet | orphan punct | http dump | para dup |
 |-----------------|---------------------|---------------|--------------|-----------|----------|
-| **RDTextract** | **98.3**            | **0**         | **0**        | **0**     | **0**    |
+| **RDTextract**  | **98.3**            | **0**         | **0**        | **0**     | **0**    |
 | html2text       | 96.2                | 1             | 148          | 70        | 2 373    |
 | trafilatura     | 96.1                | 18            | 780          | 10        | 309      |
 | markdownify     | 85.5                | 0             | 246          | 107       | 5 042    |

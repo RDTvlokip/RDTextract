@@ -5,6 +5,7 @@ edge cases). Output is optimized for LLM training: keeps semantic structure
 (headings, lists, tables, code), drops UI/technical noise (forms, media, links).
 """
 
+import json
 import logging
 import re
 from collections import Counter
@@ -42,7 +43,8 @@ class MarkdownConverter:
         try:
             from bs4 import BeautifulSoup
 
-            soup = BeautifulSoup(cleaned_html, 'html.parser')
+            from rdtextract import PARSER
+            soup = BeautifulSoup(cleaned_html, PARSER)
             root = soup.find('body') or soup
             text = cls._render(root, list_indent=0)
 
@@ -76,9 +78,13 @@ class MarkdownConverter:
             text = cls._dedup_global_blocks(text)
             text = text.strip()
 
-            # Fallback: SPA / atypical layouts where walker yields empty
-            # but <title> + meta description carry real content.
+            # Fallback chain for SPA / JS-rendered pages with empty body:
+            # 1. JSON-LD (rich structured content: Article, Recipe, FAQ, …)
+            # 2. <title> + meta description (last resort)
             if not text:
+                fallback = cls._extract_jsonld_fallback(soup)
+                if fallback:
+                    return fallback
                 fallback = cls._extract_meta_fallback(soup)
                 if fallback:
                     return fallback
@@ -88,26 +94,58 @@ class MarkdownConverter:
             logger.error(f"Error converting HTML to Markdown: {e}")
             return cleaned_html
 
-    # Stub markers (4 cases): empty, paywall, login, lone skip-link.
-    _LOW_VALUE_MARKERS = (
-        # FR paywall
-        'réservé aux abonnés', 'la suite est réservée', 'pour lire la suite',
-        'déjà abonné', 'abonnez-vous pour lire', 'contenu réservé aux abonnés',
-        'cet article est réservé',
-        # Login/auth (long phrasings to avoid false positives in real articles)
-        'connectez-vous pour', 'connectez-vous à votre compte',
-        'créer un compte pour', 'sign in to continue', 'log in to continue',
-        'please sign in',
-    )
+    # Stub markers per language. Long phrasings reduce false positives on
+    # real articles that happen to mention these words in passing.
+    _LOW_VALUE_MARKERS = {
+        'fr': (
+            'réservé aux abonnés', 'la suite est réservée', 'pour lire la suite',
+            'déjà abonné', 'abonnez-vous pour lire', 'contenu réservé aux abonnés',
+            'cet article est réservé',
+            'connectez-vous pour', 'connectez-vous à votre compte',
+            'créer un compte pour',
+        ),
+        'en': (
+            'subscribers only', 'subscribe to read', 'subscribe to continue reading',
+            'this article is for subscribers', 'already a subscriber',
+            'sign in to continue', 'log in to continue', 'please sign in',
+            'create an account to', 'register to read',
+        ),
+        'es': (
+            'solo para suscriptores', 'suscríbete para leer', 'contenido exclusivo para suscriptores',
+            'inicia sesión para', 'crea una cuenta para',
+        ),
+        'de': (
+            'nur für abonnenten', 'abonnieren sie', 'für abonnenten',
+            'melden sie sich an', 'konto erstellen',
+        ),
+        'it': (
+            'riservato agli abbonati', 'abbonati per leggere', 'contenuto riservato agli abbonati',
+            'accedi per continuare', 'crea un account per',
+        ),
+    }
     _LOW_VALUE_EXACT = frozenset({
-        'aller au contenu',
-        'impossible de générer le snapcode',
+        # FR
+        'aller au contenu', 'impossible de générer le snapcode',
+        # EN
+        'skip to content', 'skip to main content',
+        # ES
+        'saltar al contenido',
+        # DE
+        'zum inhalt springen',
+        # IT
+        'vai al contenuto',
     })
     _LOW_VALUE_MAX_CHARS = 500
 
     @classmethod
-    def is_low_value_stub(cls, markdown: str) -> bool:
-        """True if markdown carries no LLM training value (paywall/login/empty/skip-link)."""
+    def is_low_value_stub(cls, markdown: str, language: str | None = None) -> bool:
+        """True if markdown carries no LLM training value (paywall/login/empty/skip-link).
+
+        Args:
+            markdown: text to evaluate.
+            language: ISO 639-1 code ('fr', 'en', 'es', 'de', 'it') to restrict
+                marker check to one language. None = check all supported languages.
+        """
         text = markdown.strip()
         if not text:
             return True
@@ -116,10 +154,135 @@ class MarkdownConverter:
         lower = text.lower()
         if lower in cls._LOW_VALUE_EXACT:
             return True
-        return any(m in lower for m in cls._LOW_VALUE_MARKERS)
+        if language:
+            markers = cls._LOW_VALUE_MARKERS.get(language, ())
+        else:
+            markers = tuple(m for ms in cls._LOW_VALUE_MARKERS.values() for m in ms)
+        return any(m in lower for m in markers)
+
+    @classmethod
+    def _extract_jsonld_fallback(cls, soup, min_total_chars: int = 200) -> str:
+        """Build markdown from JSON-LD structured data when walker yields empty.
+
+        Recognises common Schema.org types: Article, NewsArticle, BlogPosting,
+        Recipe, FAQPage, HowTo, Product. Many SPA / SSR pages hide their real
+        content here while leaving <body> empty.
+        """
+        scripts = soup.find_all('script', attrs={'type': 'application/ld+json'})
+        if not scripts:
+            return ''
+
+        candidates: list[dict] = []
+        for s in scripts:
+            raw = s.string or s.get_text() or ''
+            if not raw.strip():
+                continue
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Flatten @graph and lists
+            if isinstance(data, list):
+                candidates.extend(d for d in data if isinstance(d, dict))
+            elif isinstance(data, dict):
+                if isinstance(data.get('@graph'), list):
+                    candidates.extend(d for d in data['@graph'] if isinstance(d, dict))
+                else:
+                    candidates.append(data)
+
+        for obj in candidates:
+            md = cls._jsonld_to_markdown(obj)
+            if md and len(md) >= min_total_chars:
+                return md
+        return ''
 
     @staticmethod
-    def _extract_meta_fallback(soup, min_total_chars: int = 200) -> str:
+    def _jsonld_to_markdown(obj: dict) -> str:
+        """Render one JSON-LD object as markdown if its @type is supported."""
+        t = obj.get('@type', '')
+        if isinstance(t, list):
+            t = t[0] if t else ''
+
+        def clean(s) -> str:
+            if not isinstance(s, str):
+                return ''
+            return re.sub(r'\s+', ' ', s).strip()
+
+        def html_to_text(s: str) -> str:
+            return clean(re.sub(r'<[^>]+>', ' ', s)) if s else ''
+
+        parts: list[str] = []
+        name = clean(obj.get('name') or obj.get('headline'))
+        desc = html_to_text(obj.get('description', ''))
+
+        if t in ('Article', 'NewsArticle', 'BlogPosting', 'TechArticle', 'Report'):
+            body = html_to_text(obj.get('articleBody', ''))
+            if name:
+                parts.append(f'# {name}')
+            if desc:
+                parts.append(desc)
+            if body:
+                parts.append(body)
+
+        elif t == 'Recipe':
+            if name:
+                parts.append(f'# {name}')
+            if desc:
+                parts.append(desc)
+            ings = obj.get('recipeIngredient') or []
+            if isinstance(ings, list) and ings:
+                parts.append('## Ingrédients\n\n' + '\n'.join(f'- {clean(i)}' for i in ings if clean(i)))
+            steps = obj.get('recipeInstructions') or []
+            if isinstance(steps, list) and steps:
+                lines = []
+                for i, step in enumerate(steps, 1):
+                    txt = step.get('text') if isinstance(step, dict) else step
+                    txt = html_to_text(txt) if isinstance(txt, str) else ''
+                    if txt:
+                        lines.append(f'{i}. {txt}')
+                if lines:
+                    parts.append('## Préparation\n\n' + '\n'.join(lines))
+
+        elif t == 'FAQPage':
+            entities = obj.get('mainEntity') or []
+            if isinstance(entities, list):
+                for q in entities:
+                    if not isinstance(q, dict):
+                        continue
+                    qtxt = clean(q.get('name'))
+                    ans = q.get('acceptedAnswer') or {}
+                    atxt = html_to_text(ans.get('text', '')) if isinstance(ans, dict) else ''
+                    if qtxt and atxt:
+                        parts.append(f'### {qtxt}\n\n{atxt}')
+
+        elif t == 'HowTo':
+            if name:
+                parts.append(f'# {name}')
+            if desc:
+                parts.append(desc)
+            steps = obj.get('step') or []
+            if isinstance(steps, list):
+                lines = []
+                for i, step in enumerate(steps, 1):
+                    if isinstance(step, dict):
+                        s_name = clean(step.get('name'))
+                        s_text = html_to_text(step.get('text', ''))
+                        line = f'{i}. **{s_name}** — {s_text}' if s_name and s_text else (s_name or s_text)
+                        if line:
+                            lines.append(f'{i}. {line}' if not line.startswith(f'{i}.') else line)
+                if lines:
+                    parts.append('## Étapes\n\n' + '\n'.join(lines))
+
+        elif t == 'Product':
+            if name:
+                parts.append(f'# {name}')
+            if desc:
+                parts.append(desc)
+
+        return '\n\n'.join(p for p in parts if p)
+
+    @staticmethod
+    def _extract_meta_fallback(soup, min_total_chars: int = 200, min_desc_alone: int = 80) -> str:
         """Build minimal markdown from <title> + meta description for SPA pages."""
         title_el = soup.find('title')
         title = re.sub(r'\s+', ' ', title_el.get_text()).strip() if title_el else ''
@@ -136,7 +299,11 @@ class MarkdownConverter:
                 if desc:
                     break
 
-        if len(title) + len(desc) < min_total_chars:
+        # Seuil double : soit la combinaison title+desc dépasse min_total_chars,
+        # soit la desc seule est suffisamment descriptive (>= min_desc_alone).
+        # Permet de récupérer les pages où le title est trivial ("Iliad", "Chipstime")
+        # mais la meta description porte du vrai contenu.
+        if len(title) + len(desc) < min_total_chars and len(desc) < min_desc_alone:
             return ''
         if title and desc:
             return f'# {title}\n\n{desc}'
@@ -278,7 +445,15 @@ class MarkdownConverter:
             return f"\n{inner}\n" if inner else ''
 
         # Passthrough (span, a, …): keep text, drop URL.
-        return cls._render_children(node, list_indent)
+        # Pour <a> on ajoute un espace trailing pour éviter que des liens
+        # adjacents sans whitespace HTML entre eux ne collent leurs textes
+        # (ex: deux boutons "Télécharger App Store" + "Google Play" dans
+        # le même <div> sans séparateur). Le post-process collapse_whitespace
+        # nettoie les espaces multiples si le HTML en contenait déjà.
+        inner = cls._render_children(node, list_indent)
+        if name == 'a' and inner and not inner.endswith((' ', '\n', '\t')):
+            inner += ' '
+        return inner
 
     @classmethod
     def _render_children(cls, node, list_indent: int) -> str:
@@ -392,6 +567,22 @@ class MarkdownConverter:
 
         ncols = max(len(r) for r in rows)
         rows = [r + [' '] * (ncols - len(r)) for r in rows]
+
+        # Drop fully-empty columns (WordPress layout-tables with image+caption
+        # where the image cell is empty after image strip).
+        for col_idx in reversed(range(ncols)):
+            if all(not r[col_idx].strip() for r in rows):
+                for r in rows:
+                    del r[col_idx]
+                ncols -= 1
+        if ncols == 0:
+            return ''
+
+        # Single non-empty cell → render as plain paragraph, not a 1×1 table
+        # (WordPress "info box" pattern: <table><tr><td>caption</td></tr></table>).
+        if ncols == 1 and len(rows) == 1:
+            cell = rows[0][0].strip()
+            return f'\n\n{cell}\n\n' if cell else ''
 
         lines = ['| ' + ' | '.join(rows[0]) + ' |']
         lines.append('|' + '|'.join([' --- '] * ncols) + '|')

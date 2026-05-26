@@ -22,7 +22,12 @@ class HTMLCleaner:
         'modal', 'overlay', 'ad', 'ads', 'advert', 'advertisement',
         'social', 'share', 'sharing', 'comment', 'comments',
         'related', 'recommended', 'newsletter', 'subscribe',
-        'widget', 'toolbar', 'pagination',
+        # 'widget' seul est trop large : matche elementor-widget-wrap,
+        # tag-widget, gutenberg-widget — qui contiennent du vrai contenu
+        # de page sur les CMS WordPress modernes. On garde uniquement les
+        # variantes spécifiques de "zone widget" (sidebar / footer widget area).
+        'widget-area', 'wp-widget-area', 'widgets-area',
+        'toolbar', 'pagination',
     }
 
     # Word-boundary regex to avoid false positives (e.g. 'ad' in 'leading-relaxed').
@@ -55,11 +60,42 @@ class HTMLCleaner:
 
     @staticmethod
     def clean_html(html: str) -> str:
-        """Clean HTML, keeping only useful content (~90% size reduction)."""
+        """Clean HTML, keeping only useful content (~90% size reduction).
+
+        Uses lxml when available (faster). Falls back to html.parser if lxml
+        produces suspiciously small output on a large input (signature of
+        malformed HTML — lxml is strict and over-nests, html.parser is lenient).
+        """
+        from rdtextract import PARSER
+        result = HTMLCleaner._clean_with(html, PARSER)
+        # Heuristic fallback: large input but tiny cleaned output → lxml hit
+        # malformed nesting. html.parser is more forgiving on broken markup.
+        if PARSER == 'lxml' and len(html) > 50_000 and len(result) < 2000:
+            alt = HTMLCleaner._clean_with(html, 'html.parser')
+            if len(alt) > len(result) * 3:
+                return alt
+        return result
+
+    @staticmethod
+    def _clean_with(html: str, parser: str) -> str:
+        """Internal: do the actual cleaning with a specific parser."""
+        # Garde anti-binaire : si le contenu commence par un magic byte de format
+        # compressé (gzip 1f 8b, deflate 78 9c/da, brotli) ou par sa forme
+        # mojibake après UTF-8 mis-decode, c'est un fetch corrompu (HTTP gzip
+        # non décompressé côté client). On retourne vide proprement plutôt que
+        # de produire du markdown illisible.
+        if not html:
+            return ''
+        binary_magics = (
+            '\x1f\x8b',          # gzip
+            '\x78\x9c', '\x78\xda', '\x78\x01',  # zlib/deflate
+            '\x1f\xc2\x8b',      # gzip mojibake (1f 8b mal-décodé via UTF-8)
+        )
+        if any(html.startswith(m) for m in binary_magics):
+            return ''
         try:
             from bs4 import BeautifulSoup, Comment
-
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html, parser)
 
             for c in list(soup.find_all(string=lambda t: isinstance(t, Comment))):
                 c.extract()
@@ -83,11 +119,27 @@ class HTMLCleaner:
             for tag in soup.find_all('link', rel='canonical'):
                 new_head_parts.append(str(tag))
 
+            # Preserve JSON-LD structured data (used by converter as fallback
+            # when <body> is empty — common on SPA pages with SSR JSON only).
+            for tag in soup.find_all('script', attrs={'type': 'application/ld+json'}):
+                new_head_parts.append(str(tag))
+
             body = soup.find('body')
             if not body:
                 body = soup
 
+            # Decompose junk tags. For structural semantic tags, apply a size
+            # guard: malformed HTML (unclosed <header>/<nav>) makes lxml strictly
+            # nest the whole body inside one of these — decomposing it would gut
+            # the page. If the tag holds > _STRUCTURAL_KEEP_THRESHOLD chars, it's
+            # almost certainly a parser artifact, not real chrome.
+            _STRUCTURAL = {'nav', 'header', 'footer', 'aside'}
+            _STRUCTURAL_KEEP_THRESHOLD = 1000
             for tag in body.find_all(list(HTMLCleaner._JUNK_TAGS)):
+                if tag.parent is None:
+                    continue
+                if tag.name in _STRUCTURAL and len(tag.get_text(strip=True)) > _STRUCTURAL_KEEP_THRESHOLD:
+                    continue  # likely malformed HTML wrapping real content
                 tag.decompose()
 
             # Strip icon fonts (Material Symbols/Icons, FontAwesome, Glyphicons)
@@ -112,9 +164,15 @@ class HTMLCleaner:
             for tag in list(body.find_all(class_=_hidden_re)):
                 if tag.parent is not None:
                     tag.decompose()
+            # `hidden` attribute : React 18 SSR streaming utilise <div hidden> pour
+            # les Suspense boundaries (contenu serveur prêt mais non hydraté).
+            # On préserve ces divs si elles contiennent beaucoup de texte.
             for tag in list(body.find_all(attrs={'hidden': True})):
-                if tag.parent is not None:
-                    tag.decompose()
+                if tag.parent is None:
+                    continue
+                if len(tag.get_text(strip=True)) > 1000:
+                    continue  # likely React 18 SSR content
+                tag.decompose()
             for tag in list(body.find_all(attrs={'aria-hidden': 'true'})):
                 if tag.parent is not None:
                     tag.decompose()
@@ -122,10 +180,33 @@ class HTMLCleaner:
                 if tag.parent is not None:
                     tag.decompose()
 
+            # Size guard pour la décomposition par classe/id : si un élément matche
+            # junk MAIS contient une part importante du texte du body, c'est presque
+            # toujours un faux positif (CMS verbeux : 'main-content with-nav',
+            # 'related-page', 'header__wrapper', etc.).
+            #
+            # Triple critère :
+            #   1. seuil absolu 2000c (pour gros sites)
+            #   2. ratio > 40% du body (pour petits sites / landing pages)
+            #   3. structural + > 1000c (HTML malformé qui wrappe la page)
+            _CONTENT_KEEP_THRESHOLD = 2000
+            _CONTENT_KEEP_RATIO = 0.40
+            body_text_len = max(1, len(body.get_text(strip=True)))
+
             for tag in list(body.find_all(True)):
                 if tag.parent is None:
                     continue
                 if HTMLCleaner._is_junk_element(tag):
+                    text_len = len(tag.get_text(strip=True))
+                    # Structural tag avec gros contenu = HTML malformé
+                    if tag.name in _STRUCTURAL and text_len > _STRUCTURAL_KEEP_THRESHOLD:
+                        continue
+                    # Tag normal contenant beaucoup de texte (absolu OU ratio)
+                    if tag.name not in _STRUCTURAL and (
+                        text_len > _CONTENT_KEEP_THRESHOLD
+                        or text_len / body_text_len > _CONTENT_KEEP_RATIO
+                    ):
+                        continue
                     tag.decompose()
 
             _KEEP_ATTRS = {'href', 'src', 'alt', 'datetime', 'title'}

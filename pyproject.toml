@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RDTextract"
-version = "0.1.1"
+version = "0.2.0"
 description = "HTML→Markdown extractor optimized for LLM training corpora — zero noise artifacts, integrated quality scoring, low-value stub detection."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,14 +34,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fast = [
+    "lxml>=4.9",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "lxml>=4.9",
 ]
 benchmark = [
     "trafilatura",
     "markdownify",
     "html2text",
+    "lxml>=4.9",
 ]
 
 [project.urls]

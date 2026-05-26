@@ -17,12 +17,17 @@ Usage:
 import argparse
 import hashlib
 import io
+import os
 import ssl
 import sys
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
+
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 
 TRANCO_URL = 'https://tranco-list.eu/top-1m.csv.zip'
 ROOT = Path(__file__).parent
@@ -69,22 +74,45 @@ def load_or_fetch_list(top: int, refresh: bool) -> list[str]:
     return domains
 
 
-def fetch_html(url: str) -> bytes | None:
+def fetch_html(url: str) -> tuple[bytes | None, str]:
+    """Fetch URL, return (bytes_or_none, error_msg). Thread-safe."""
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
-            return resp.read()
+            return resp.read(), ''
     except Exception as e:
-        print(f'  [skip] {url}: {type(e).__name__}: {e}')
-        return None
+        return None, f'{type(e).__name__}: {e}'
+
+
+def _fetch_one(domain: str, refresh_html: bool) -> tuple[str, str, int]:
+    """Worker: fetch one domain, write to cache. Returns (domain, status, size)."""
+    url = f'https://{domain}/'
+    key = hashlib.sha256(url.encode()).hexdigest()[:16]
+    path = CACHE_DIR / f'{key}.html'
+    if path.exists() and not refresh_html:
+        return domain, 'skip', path.stat().st_size
+
+    t0 = time.perf_counter()
+    raw, err = fetch_html(url)
+    elapsed = time.perf_counter() - t0
+    if raw is None:
+        return domain, f'err {err[:60]} ({elapsed:.1f}s)', 0
+    try:
+        html = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        html = raw.decode('latin-1', errors='replace')
+    path.write_text(html, encoding='utf-8')
+    return domain, f'ok ({elapsed:.1f}s)', len(html)
 
 
 def main():
     ap = argparse.ArgumentParser(description='Fetch Tranco top-N .fr homepages for benchmark.')
     ap.add_argument('--top', type=int, default=100, help='Number of .fr domains to fetch')
+    ap.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
+                    help=f'Parallel fetch workers (default {DEFAULT_WORKERS} = cpu_count-1)')
     ap.add_argument('--refresh-list', action='store_true', help='Re-download Tranco list')
     ap.add_argument('--refresh-html', action='store_true', help='Re-fetch HTML even if cached')
     args = ap.parse_args()
@@ -92,27 +120,28 @@ def main():
     domains = load_or_fetch_list(args.top, args.refresh_list)
     CACHE_DIR.mkdir(exist_ok=True)
 
-    n_ok = n_skip = 0
-    for i, domain in enumerate(domains, 1):
-        url = f'https://{domain}/'
-        key = hashlib.sha256(url.encode()).hexdigest()[:16]
-        path = CACHE_DIR / f'{key}.html'
-        if path.exists() and not args.refresh_html:
-            n_skip += 1
-            continue
-        print(f'  [{i:3}/{len(domains)}] {url}')
-        raw = fetch_html(url)
-        if raw is None:
-            continue
-        try:
-            html = raw.decode('utf-8')
-        except UnicodeDecodeError:
-            html = raw.decode('latin-1', errors='replace')
-        path.write_text(html, encoding='utf-8')
-        n_ok += 1
-        time.sleep(0.3)  # be polite
+    print(f'\nFetching {len(domains)} domains with {args.workers} workers …\n')
+    counts = {'ok': 0, 'skip': 0, 'err': 0}
+    counts_lock = Lock()
+    t_start = time.perf_counter()
 
-    print(f'\nDone. Fetched: {n_ok}, cached (skipped): {n_skip}, total cache files: {len(list(CACHE_DIR.glob("*.html")))}')
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = {ex.submit(_fetch_one, d, args.refresh_html): d for d in domains}
+        for i, fut in enumerate(as_completed(futures), 1):
+            domain, status, size = fut.result()
+            kind = 'ok' if status.startswith('ok') else ('skip' if status == 'skip' else 'err')
+            with counts_lock:
+                counts[kind] += 1
+            if i % 25 == 0 or kind == 'err':
+                rate = i / (time.perf_counter() - t_start)
+                eta = (len(domains) - i) / rate if rate else 0
+                print(f'  [{i:>4}/{len(domains)}] {domain:<40} {status:<35} '
+                      f'({size/1024:>6.1f}KB)  rate={rate:.1f}/s eta={eta/60:.1f}min')
+
+    elapsed = time.perf_counter() - t_start
+    total_files = len(list(CACHE_DIR.glob('*.html')))
+    print(f'\nDone in {elapsed/60:.1f}min. ok={counts["ok"]} skip={counts["skip"]} err={counts["err"]} '
+          f'total_cache={total_files}')
     return 0
 
 

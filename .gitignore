@@ -12,3 +12,10 @@ venv/
 .idea/
 .vscode/
 benchmark/cache/
+benchmark/outliers/
+benchmark/comparison/
+
+# Ad-hoc test artifacts at repo root
+/*.html
+/*.md
+!/README.md

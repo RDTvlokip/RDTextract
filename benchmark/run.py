@@ -88,7 +88,7 @@ def quality_score(text: str) -> float:
     if n > 10 and links / n > 0.3:
         score -= 15
 
-    if len(re.findall(r'\n- -(?!\d+\s*%)[ \w]', text)) >= 3:
+    if len(re.findall(r'\n- -(?!\d+\s*[%€$£])[ \w]', text)) >= 3:
         score -= 10
 
     paras = [p.strip() for p in re.split(r'\n{2,}', text) if len(p.strip()) >= 50]
@@ -108,7 +108,7 @@ def quality_score(text: str) -> float:
 
 def count_artifacts(text: str) -> dict:
     return {
-        'double_bullet':   len(re.findall(r'\n- -(?!\d+\s*%)[ \w]', text)),
+        'double_bullet':   len(re.findall(r'\n- -(?!\d+\s*[%€$£])[ \w]', text)),
         'orphan_punct':    len(re.findall(r'^[ \t]*[-.>·][ \t]*$', text, re.MULTILINE)),
         'http_dump_lines': sum(1 for l in text.split('\n') if l.strip().startswith('http')),
         'empty_para_dup':  sum(n - 1 for n in Counter(

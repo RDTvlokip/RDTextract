@@ -3,7 +3,19 @@
 from rdtextract.cleaner import HTMLCleaner
 from rdtextract.converter import MarkdownConverter
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
+
+
+def _detect_parser() -> str:
+    """Use lxml if available (2-3× faster), fall back to stdlib html.parser."""
+    try:
+        import lxml  # noqa: F401
+        return 'lxml'
+    except ImportError:
+        return 'html.parser'
+
+
+PARSER = _detect_parser()
 
 __all__ = [
     "HTMLCleaner",
@@ -30,6 +42,11 @@ def extract(html: str) -> str:
     return MarkdownConverter.to_markdown(HTMLCleaner.clean_html(html))
 
 
-def is_low_value_stub(markdown: str) -> bool:
-    """True if the markdown is a paywall, login stub, skip-link, or empty page (no LLM training value)."""
-    return MarkdownConverter.is_low_value_stub(markdown)
+def is_low_value_stub(markdown: str, language: str | None = None) -> bool:
+    """True if the markdown is a paywall, login stub, skip-link, or empty page (no LLM training value).
+
+    Args:
+        markdown: text to evaluate.
+        language: ISO 639-1 code ('fr', 'en', 'es', 'de', 'it'). None = check all supported languages.
+    """
+    return MarkdownConverter.is_low_value_stub(markdown, language=language)

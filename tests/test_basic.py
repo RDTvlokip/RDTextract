@@ -186,3 +186,89 @@ def test_real_2x2_table_preserved():
 def test_parser_detection():
     """PARSER must resolve to either 'lxml' (if installed) or 'html.parser'."""
     assert rdtextract.PARSER in ('lxml', 'html.parser')
+
+
+# ── Robustness fixes ─────────────────────────────────────────────────────────
+
+def test_deeply_nested_html_no_leak_and_keeps_outer_content():
+    """Pathological nesting must not leak HTML nor abort: content above the
+    depth cap is preserved, the deep subtree is flattened, no exception escapes."""
+    html = ('<html><body><article><h1>Real Title</h1>'
+            '<p>Intro paragraph.</p>'
+            '<div>' + '<div>' * 3000 + 'deep' + '</div>' * 3000 + '</div>'
+            '<p>Outro paragraph.</p></article></body></html>')
+    md = rdtextract.extract(html)
+    assert '<div' not in md.lower() and '<!doctype' not in md.lower()
+    assert '# Real Title' in md
+    assert 'Intro paragraph.' in md
+    assert 'Outro paragraph.' in md
+
+
+def test_binary_gzip_leak_returns_empty():
+    """A gzip magic-byte prefix (undecompressed fetch) yields empty, not mojibake."""
+    assert rdtextract.extract('\x1f\x8b\x08\x00garbage bytes here') == ''
+
+
+def test_low_value_stub_non_str_is_stub():
+    """Non-str input (e.g. None from a failed step) is treated as low-value."""
+    assert rdtextract.is_low_value_stub(None)
+    assert rdtextract.is_low_value_stub(123)
+
+
+# ── Skip-link stripping ──────────────────────────────────────────────────────
+
+def test_skip_link_stripped_simple():
+    html = ("<html><body><a href='#main'>Aller au contenu principal</a>"
+            "<main><p>Le vrai contenu de la page.</p></main></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Aller au contenu principal' not in md
+    assert 'Le vrai contenu de la page.' in md
+
+
+def test_skip_link_stripped_filler_and_multilang():
+    for skip in ('Ignorer pour aller au contenu', 'Skip to content',
+                 'Skip Navigation', 'Zum Inhalt springen', 'Vai al contenuto'):
+        html = f"<html><body><p>{skip}</p><p>Contenu réel ici présent.</p></body></html>"
+        md = rdtextract.extract(html)
+        assert skip not in md, f"not stripped: {skip}"
+        assert 'Contenu réel ici présent.' in md
+
+
+def test_skip_link_concatenated_nav_bar_stripped():
+    """Long concatenated skip-nav bars (no separators) must be dropped too."""
+    bar = ('Aller au contenu principal Aller au menu principal '
+           'Aller à la recherche Aller au pied de page')
+    html = f"<html><body><p>{bar}</p><p>Article véritable et substantiel.</p></body></html>"
+    md = rdtextract.extract(html)
+    assert 'Aller au menu principal' not in md
+    assert 'Article véritable et substantiel.' in md
+
+
+def test_skip_link_does_not_eat_real_content():
+    """A real sentence merely starting with the words must NOT be dropped."""
+    html = ("<html><body><p>Comment aller au contenu du coffre-fort numérique "
+            "sans perdre ses données personnelles importantes.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert 'coffre-fort numérique' in md
+
+
+# ── Space-before-punctuation (the <a> trailing-space artifact) ────────────────
+
+def test_no_space_before_punctuation_after_link():
+    html = ("<html><body><p>Rendez-vous sur "
+            "<a href='https://x.fr'>ASNR Academy</a>.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert 'ASNR Academy.' in md
+    assert 'Academy .' not in md
+
+
+def test_punct_fix_preserves_domains_decimals_and_french_typography():
+    html = ("<html><body>"
+            "<p>Notre site <a href='#'>Domaine</a> .com fonctionne.</p>"
+            "<p>Le prix est de <a href='#'>3</a> ,50 euros au total.</p>"
+            "<p>Est-ce vrai <a href='#'>vraiment</a> ? Oui bien sûr !</p>"
+            "</body></html>")
+    md = rdtextract.extract(html)
+    assert '.com' in md and 'Domaine.com' not in md   # domain extension kept spaced-safe
+    assert ',50' in md and '3,50' not in md            # decimal comma preserved
+    assert 'vraiment ?' in md                          # French space before ? preserved

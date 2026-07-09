@@ -1,5 +1,7 @@
 """HTML cleaner: strips nav/footer/scripts/ads/hidden elements, keeps semantic content."""
 
+from __future__ import annotations
+
 import logging
 import re
 
@@ -229,5 +231,8 @@ class HTMLCleaner:
             return cleaned
 
         except Exception as e:
+            # Returning the raw input would push unstripped nav/scripts/markup
+            # downstream into the converter (and ultimately the corpus). Fail
+            # closed with an empty string instead.
             logger.error(f"Error cleaning HTML: {e}")
-            return html
+            return ''

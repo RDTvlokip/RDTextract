@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RDTextract"
-version = "0.2.0"
+dynamic = ["version"]
 description = "HTML→Markdown extractor optimized for LLM training corpora — zero noise artifacts, integrated quality scoring, low-value stub detection."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,6 +53,9 @@ benchmark = [
 Homepage = "https://github.com/RDTvlokip/RDTextract"
 Repository = "https://github.com/RDTvlokip/RDTextract"
 Issues = "https://github.com/RDTvlokip/RDTextract/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "rdtextract.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

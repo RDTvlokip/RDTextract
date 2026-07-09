@@ -15,7 +15,9 @@ benchmark/cache/
 benchmark/outliers/
 benchmark/comparison/
 
-# Ad-hoc test artifacts at repo root
+# Ad-hoc test artifacts at repo root (fetched pages dumped by the benchmark).
+# Keep project docs: README + release notes.
 /*.html
 /*.md
 !/README.md
+!/RELEASE_*.md

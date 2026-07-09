@@ -15,6 +15,26 @@ HTML→Markdown extractor built for **AI / LLM training corpora** — every byte
 - **`is_low_value_stub()`** filter for paywalls, login walls, skip-link stubs, empty pages.
 - **One required dependency**: `beautifulsoup4`. Optional `[fast]` extra adds `lxml` for 2-3× speed.
 
+## What's new in v0.2.1
+
+Bug-fix + quality release. **v0.2.0 fails to import on Python 3.9** (a `str | None`
+annotation evaluated at import time) — v0.2.1 restores the advertised 3.9 support.
+
+- **Python 3.9 import fixed** — `from __future__ import annotations` added; the CI
+  matrix now covers 3.9 → 3.12 so this can't regress.
+- **Fail-closed conversion** — on any internal error the converter/cleaner now
+  return `""` instead of leaking raw HTML into the corpus.
+- **Recursion guard** — pathological nesting (thousands of unclosed tags) is
+  flattened past a depth cap instead of aborting the whole page.
+- **Skip-link stripping** — accessibility skip-links ("Aller au contenu", "Skip to
+  content", concatenated skip-nav bars) are removed from the output. They opened
+  **20 % of pages** in the 672-page benchmark; now **0 %**, with zero false
+  positives on that corpus.
+- **Space-before-punctuation fix** — the `<a>`-renderer no longer leaves `"lien ."`;
+  1 805 → 41 occurrences across the benchmark, while `.com`/`.fr` extensions,
+  decimals, and French typography (space before `; : ! ?`) are preserved.
+- **Single-sourced version** + `is_low_value_stub(None)` no longer raises.
+
 ## What's new in v0.2.0
 
 Major release with substantial gains across every metric measured on the **Tranco top-1000 .fr** benchmark (672 pages):
@@ -44,7 +64,7 @@ Major release with substantial gains across every metric measured on the **Tranc
 **Tooling**:
 - New `benchmark/find_outliers.py` — classifies suspicious extractions (EMPTY_LARGE / TINY_RATIO / HUGE_RATIO / ARTIFACTS / SPA_NO_FALLBACK) for human review.
 - New `benchmark/compare_outputs.py` — generates side-by-side `.md` outputs of the 4 extractors for any sample of pages.
-- Test suite expanded from **6 → 17 tests** (JSON-LD types, multi-lang, layout-tables, parser detection).
+- Test suite expanded from **6 → 26 tests** (JSON-LD types, multi-lang, layout-tables, parser detection, robustness + skip-link/punctuation regressions).
 
 **API compatibility**: 100% backward-compatible with v0.1.x. Existing code keeps working; new features are opt-in.
 
@@ -180,7 +200,7 @@ Custom walker (no `markdownify` dependency) avoids ~50% of buggy edge cases that
 
 ```bash
 pip install -e ".[dev,benchmark]"
-pytest -q                          # 17 tests
+pytest -q                          # 26 tests
 python benchmark/fetch.py --top 1000   # download HTML cache
 python benchmark/run.py            # 4-extractor comparison
 python benchmark/find_outliers.py  # find pages where extraction is suspect

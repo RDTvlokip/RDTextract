@@ -5,6 +5,8 @@ edge cases). Output is optimized for LLM training: keeps semantic structure
 (headings, lists, tables, code), drops UI/technical noise (forms, media, links).
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -65,10 +67,24 @@ class MarkdownConverter:
             # Restore breadcrumb separators between inline siblings.
             text = re.sub(r'(\w)[ \t]*([>›»])[ \t]*(?=\w)', r'\1 \2 ', text)
 
+            # Drop the space our <a> renderer injects when a link is immediately
+            # followed by punctuation ("Visitez ce lien ." → "Visitez ce lien.").
+            # Guarded so we never touch domain/extension dots (" .com", " .fr"),
+            # decimals (" ,5"), or French typography (space before ; : ! ? » is
+            # correct in FR and left untouched).
+            text = re.sub(r'(\S) +\.(?![\w.])', r'\1.', text)   # " ." but not " .com"
+            text = re.sub(r'(\S) +,(?!\d)', r'\1,', text)       # " ," but not " ,5"
+            text = re.sub(r'(\S) +([)\]…])', r'\1\2', text)     # " )" " ]" " …"
+            text = re.sub(r'(\S) +\.\.\.', r'\1...', text)      # " ..." (ellipsis)
+
             # Strip lines containing only orphan punctuation.
             text = re.sub(r'^[ \t]*[-.>·][ \t]*$', '', text, flags=re.MULTILINE)
             # Strip lines containing only a bare URL (canonical/logo href leaks).
             text = re.sub(r'^[ \t]*https?://\S+[ \t]*$', '', text, flags=re.MULTILINE)
+            # Strip accessibility skip-links ("Aller au contenu", "Skip to
+            # content", "Ignorer pour aller au contenu", skip-nav bars) that leak
+            # in as the first line on ~20% of pages — pure UI noise.
+            text = cls._strip_skip_links(text)
             text = re.sub(r'\n{3,}', '\n\n', text)
 
             for i, code in enumerate(placeholders):
@@ -91,8 +107,11 @@ class MarkdownConverter:
             return text
 
         except Exception as e:
+            # Never leak raw HTML into the output: for an LLM training corpus an
+            # empty string (correctly flagged by is_low_value_stub) is far safer
+            # than markup masquerading as Markdown. Callers treat "" as a skip.
             logger.error(f"Error converting HTML to Markdown: {e}")
-            return cleaned_html
+            return ''
 
     # Stub markers per language. Long phrasings reduce false positives on
     # real articles that happen to mention these words in passing.
@@ -146,6 +165,10 @@ class MarkdownConverter:
             language: ISO 639-1 code ('fr', 'en', 'es', 'de', 'it') to restrict
                 marker check to one language. None = check all supported languages.
         """
+        # Non-str (e.g. None from a failed upstream step) carries no training
+        # value: treat as a stub to skip rather than raising in the pipeline.
+        if not isinstance(markdown, str):
+            return True
         text = markdown.strip()
         if not text:
             return True
@@ -333,6 +356,51 @@ class MarkdownConverter:
             out.append(block)
         return '\n\n'.join(out)
 
+    # Accessibility skip-links: screen-reader shortcuts that carry no training
+    # value. A line is dropped when it *starts with* one of these (word-boundary
+    # anchored, so "Comment aller au contenu du coffre" is NOT a skip-link), or
+    # starts with a filler verb and contains one, subject to a length/nav guard.
+    _SKIP_LINK_CORES = (
+        'aller au contenu', 'aller au menu', 'aller à la navigation',
+        'aller directement au contenu', 'accéder au contenu', 'accéder directement au contenu',
+        'passer au contenu', 'passer directement au contenu',
+        'skip to main content', 'skip to content', 'skip navigation',
+        'skip to navigation', 'jump to content', 'jump to navigation',
+        'saltar al contenido', 'ir al contenido',
+        'zum inhalt springen', 'zum hauptinhalt springen', 'direkt zum inhalt',
+        'vai al contenuto',
+    )
+    _SKIP_LINK_FILLERS = ('ignorer ', 'passer ', 'cliquez ', 'sauter ', 'aller directement ')
+    # Verb-phrases that open a skip-link. ≥3 of them on one line = a concatenated
+    # skip-nav bar ("Aller au contenu Aller au menu Aller à la recherche …"),
+    # which we drop regardless of length.
+    _SKIP_LINK_VERBS = (
+        'aller au', 'aller à', 'skip to', 'passer au', 'passer à',
+        'accéder au', 'accéder à', 'saltar al', 'ir al', 'vai al', 'zum ',
+    )
+
+    @classmethod
+    def _strip_skip_links(cls, text: str) -> str:
+        """Remove standalone accessibility skip-link lines (see _SKIP_LINK_CORES)."""
+        cores = cls._SKIP_LINK_CORES
+        out = []
+        for line in text.split('\n'):
+            norm = line.strip().lower()
+            if norm:
+                is_skip = norm.startswith(cores) or (
+                    norm.startswith(cls._SKIP_LINK_FILLERS) and any(c in norm for c in cores)
+                )
+                # Drop when: short UI string, an unmistakable skip-nav bar
+                # (pipe/chevron separated), or a run of ≥3 skip verb-phrases.
+                if is_skip and (
+                    len(norm) <= 60
+                    or '|' in norm or '›' in norm or '·' in norm
+                    or sum(norm.count(v) for v in cls._SKIP_LINK_VERBS) >= 3
+                ):
+                    continue
+            out.append(line)
+        return '\n'.join(out)
+
     @staticmethod
     def _dedup_consecutive_blocks(text: str) -> str:
         """Drop consecutive identical blocks (responsive mobile/desktop duplicates)."""
@@ -349,9 +417,31 @@ class MarkdownConverter:
 
     # ── Recursive walker ───────────────────────────────────────────────────
 
+    # Depth cap for the recursive walker. Real pages rarely nest past ~50
+    # levels; pathological/adversarial markup (thousands of unclosed <div>s)
+    # would otherwise blow Python's recursion limit and abort the whole
+    # conversion. Past the cap we flatten the subtree to plain text so content
+    # rendered *above* the cap is preserved and no exception escapes. Kept well
+    # under Python's ~1000-frame limit (the walker uses ~2 frames per level).
+    _MAX_DEPTH = 200
+
     @classmethod
-    def _render(cls, node, list_indent: int = 0) -> str:
+    def _render(cls, node, list_indent: int = 0, depth: int = 0) -> str:
         from bs4 import NavigableString, Tag
+
+        if depth > cls._MAX_DEPTH:
+            if isinstance(node, Tag):
+                # get_text() is itself recursive; on a still-deeper subtree it
+                # can overflow. Guard it so one pathological branch can't sink
+                # the whole document.
+                try:
+                    return re.sub(r'\s+', ' ', node.get_text(' ', strip=True))
+                except RecursionError:
+                    return ''
+            if isinstance(node, NavigableString):
+                text = str(node)
+                return re.sub(r'\s+', ' ', text) if text.strip() else ' '
+            return ''
 
         if isinstance(node, NavigableString):
             text = str(node)
@@ -369,11 +459,11 @@ class MarkdownConverter:
 
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             level = int(name[1])
-            text = cls._inline(node).strip()
+            text = cls._inline(node, depth).strip()
             return f"\n\n{'#' * level} {text}\n\n" if text else ''
 
         if name == 'p':
-            text = cls._inline(node).strip()
+            text = cls._inline(node, depth).strip()
             return f"\n\n{text}\n\n" if text else ''
 
         if name == 'br':
@@ -385,7 +475,7 @@ class MarkdownConverter:
             return '\n\n---\n\n'
 
         if name == 'blockquote':
-            inner = cls._render_children(node, list_indent).strip()
+            inner = cls._render_children(node, list_indent, depth).strip()
             quoted = '\n'.join(f'> {l}' if l else '>' for l in inner.split('\n'))
             return f"\n\n{quoted}\n\n"
 
@@ -403,13 +493,13 @@ class MarkdownConverter:
             return f"`{node.get_text()}`"
 
         if name in ('ul', 'ol', 'menu'):
-            return cls._render_list(node, list_indent)
+            return cls._render_list(node, list_indent, depth)
 
         if name == 'dl':
             parts = []
             for child in node.children:
                 if isinstance(child, Tag):
-                    inner = cls._inline(child).strip()
+                    inner = cls._inline(child, depth).strip()
                     if not inner:
                         continue
                     if child.name == 'dt':
@@ -419,29 +509,29 @@ class MarkdownConverter:
             return '\n\n' + ''.join(parts).strip() + '\n\n' if parts else ''
 
         if name == 'table':
-            return cls._render_table(node)
+            return cls._render_table(node, depth)
 
         if name in ('strong', 'b'):
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"**{inner}**" if inner else ''
         if name in ('em', 'i'):
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"*{inner}*" if inner else ''
         if name in ('s', 'del'):
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"~~{inner}~~" if inner else ''
         if name == 'u':
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"__{inner}__" if inner else ''
         if name == 'mark':
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"=={inner}==" if inner else ''
         if name in ('kbd', 'samp', 'var'):
-            inner = cls._inline(node).strip()
+            inner = cls._inline(node, depth).strip()
             return f"`{inner}`" if inner else ''
 
         if name in cls._BLOCK_WRAPPERS:
-            inner = cls._render_children(node, list_indent).strip()
+            inner = cls._render_children(node, list_indent, depth).strip()
             return f"\n{inner}\n" if inner else ''
 
         # Passthrough (span, a, …): keep text, drop URL.
@@ -450,17 +540,17 @@ class MarkdownConverter:
         # (ex: deux boutons "Télécharger App Store" + "Google Play" dans
         # le même <div> sans séparateur). Le post-process collapse_whitespace
         # nettoie les espaces multiples si le HTML en contenait déjà.
-        inner = cls._render_children(node, list_indent)
+        inner = cls._render_children(node, list_indent, depth)
         if name == 'a' and inner and not inner.endswith((' ', '\n', '\t')):
             inner += ' '
         return inner
 
     @classmethod
-    def _render_children(cls, node, list_indent: int) -> str:
-        return ''.join(cls._render(c, list_indent) for c in node.children)
+    def _render_children(cls, node, list_indent: int, depth: int = 0) -> str:
+        return ''.join(cls._render(c, list_indent, depth + 1) for c in node.children)
 
     @classmethod
-    def _inline(cls, node) -> str:
+    def _inline(cls, node, depth: int = 0) -> str:
         """Render inline content only (for headings, paragraphs, cells)."""
         from bs4 import NavigableString, Tag
         out = ''
@@ -468,7 +558,7 @@ class MarkdownConverter:
             if isinstance(child, NavigableString):
                 text = re.sub(r'\s+', ' ', str(child))
             elif isinstance(child, Tag) and child.name not in cls._SKIP_TAGS:
-                text = cls._render(child, 0)
+                text = cls._render(child, 0, depth + 1)
             else:
                 continue
             if text:
@@ -478,7 +568,7 @@ class MarkdownConverter:
         return out.strip()
 
     @classmethod
-    def _render_list(cls, node, list_indent: int) -> str:
+    def _render_list(cls, node, list_indent: int, depth: int = 0) -> str:
         from bs4 import Tag
         is_ordered = node.name == 'ol'
         indent_str = '  ' * list_indent
@@ -491,13 +581,13 @@ class MarkdownConverter:
             # <li> wrapping only a sublist → flatten at current level
             # (avoids "- - X" pattern in directories like service-public.fr).
             if cls._li_is_sublist_only(child):
-                flattened = cls._render_children(child, list_indent).strip()
+                flattened = cls._render_children(child, list_indent, depth).strip()
                 if flattened:
                     items.append(flattened)
                 continue
 
             marker = f'{idx}.' if is_ordered else '-'
-            content = cls._render_children(child, list_indent + 1).strip()
+            content = cls._render_children(child, list_indent + 1, depth).strip()
             # Strip a leading bullet from content to avoid "- - X" artifacts.
             # Two distinct triggers:
             #   1. Source HTML has literal "- " in <li> text (CMS quirk where
@@ -539,7 +629,7 @@ class MarkdownConverter:
         return True
 
     @classmethod
-    def _render_table(cls, table) -> str:
+    def _render_table(cls, table, depth: int = 0) -> str:
         """Convert <table> to Markdown table. Handles nested tables and colspan."""
         rows = []
         for tr in table.find_all('tr'):
@@ -555,7 +645,7 @@ class MarkdownConverter:
                     colspan = 1
                 for nested in cell.find_all('table'):
                     nested.replace_with(nested.get_text(' ', strip=True))
-                txt = cls._inline(cell).replace('|', '\\|').replace('\n', ' ').strip()
+                txt = cls._inline(cell, depth).replace('|', '\\|').replace('\n', ' ').strip()
                 cells.append(txt or ' ')
                 for _ in range(colspan - 1):
                     cells.append(' ')

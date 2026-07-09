@@ -1,6 +1,8 @@
 """Smoke tests for RDTextract. To be expanded with edge cases (paywall variants,
 hr-in-li, dedup, meta fallback, table colspan, …)."""
 
+import re
+
 import rdtextract
 
 
@@ -155,14 +157,15 @@ def test_low_value_stub_long_real_article_passes():
 
 
 def test_layout_table_one_empty_column_collapsed():
-    """WordPress-style image+caption table: image cell empty, caption rendered as 1-col."""
+    """Image+caption layout table: empty image column dropped, captions kept as
+    plain paragraphs (a single-column table is layout, not tabular data)."""
     html = """<html><body><table>
       <tr><td>Légende A</td><td></td></tr>
       <tr><td>Légende B</td><td></td></tr>
     </table></body></html>"""
     md = rdtextract.extract(html)
-    assert "| Légende A |" in md
-    assert "| |" not in md  # empty side cell removed
+    assert "Légende A" in md and "Légende B" in md  # content preserved
+    assert "|" not in md                            # collapsed to paragraphs, no table
 
 
 def test_single_cell_table_becomes_paragraph():
@@ -272,3 +275,229 @@ def test_punct_fix_preserves_domains_decimals_and_french_typography():
     assert '.com' in md and 'Domaine.com' not in md   # domain extension kept spaced-safe
     assert ',50' in md and '3,50' not in md            # decimal comma preserved
     assert 'vraiment ?' in md                          # French space before ? preserved
+
+
+# ── Invisible / zero-width character normalization ───────────────────────────
+
+def test_invisible_characters_normalized():
+    html = ("<html><body><p>Zero​width​and﻿bom soft­hyphen</p>"
+            "<p>non breaking spaces</p></body></html>")
+    md = rdtextract.extract(html)
+    for ch in ('​', '﻿', '­', ' ', ' '):
+        assert ch not in md, f"invisible char {ch!r} leaked"
+    assert 'non breaking spaces' in md   # NBSP/narrow-NBSP folded to plain space
+
+
+# ── UI-noise standalone lines (share / print / back-to-top) ──────────────────
+
+def test_ui_noise_lines_stripped():
+    for label in ('Haut de page', 'Retour en haut', 'Partager', 'Imprimer', 'Tweeter'):
+        html = f"<html><body><p>{label}</p><p>Contenu réel de la page ici.</p></body></html>"
+        md = rdtextract.extract(html)
+        assert not re.search(rf'(?im)^{re.escape(label)}\s*$', md), f"not stripped: {label}"
+        assert 'Contenu réel de la page ici.' in md
+
+
+def test_ui_noise_does_not_eat_real_content():
+    """A real heading/sentence that merely starts with the word is kept."""
+    html = ("<html><body><h2>Partager votre expérience avec la communauté</h2>"
+            "<p>Imprimer les documents administratifs avant le rendez-vous.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Partager votre expérience' in md
+    assert 'Imprimer les documents' in md
+
+
+def test_skip_link_extra_variants_and_concatenated_no_core():
+    """New variants + a concatenated bar that doesn't open with a known core."""
+    for bar in ('Skip to the content',
+                'Aller au texte Aller aux onglets Politique d’accessibilité du site',
+                'Skip to accessibility mode link Aller au contenu principal Skip to main menu'):
+        html = f"<html><body><p>{bar}</p><p>Le contenu réel et substantiel de la page.</p></body></html>"
+        md = rdtextract.extract(html)
+        assert 'Le contenu réel et substantiel de la page.' in md
+        assert 'onglets' not in md and 'accessibility mode' not in md
+
+
+def test_skip_verbs_chain_in_real_sentence_kept():
+    """A real sentence chaining 'aller au …' verbs (no skip destination) is kept."""
+    html = ("<html><body><p>Ce week-end je vais aller au marché, aller à la plage "
+            "et aller au cinéma avec mes amis.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert 'aller au marché' in md
+    assert 'aller au cinéma' in md
+
+
+# ── Cookie banners flagged as low-value ──────────────────────────────────────
+
+def test_cookie_banner_is_low_value_stub():
+    banner = ("Nous utilisons des cookies pour améliorer votre expérience. "
+              "En poursuivant votre navigation, vous acceptez le dépôt de cookies.")
+    assert rdtextract.is_low_value_stub(banner)
+    # A long real article that mentions cookies once is NOT flagged.
+    article = ("# Recette de cookies maison\n\n"
+               "Ces cookies au chocolat sont délicieux. " * 30)
+    assert not rdtextract.is_low_value_stub(article)
+
+
+# ── Breadcrumb trails ────────────────────────────────────────────────────────
+
+def test_breadcrumb_trail_stripped():
+    for trail in ('Accueil / Actualités / Rentrée 2026', 'Accueil > Formation > Master',
+                  'Home » News » Podcast', 'Vous êtes ici : Accueil > Agenda'):
+        html = f"<html><body><p>{trail}</p><p>Le contenu réel de la page ici présent.</p></body></html>"
+        md = rdtextract.extract(html)
+        assert 'Le contenu réel de la page ici présent.' in md
+        assert 'Actualités / Rentrée' not in md and 'Formation > Master' not in md
+
+
+def test_breadcrumb_does_not_eat_real_content():
+    """A real sentence starting with 'Accueil'/'Vous êtes ici' (no trail) is kept."""
+    html = ("<html><body><p>Accueil personnalisé de nos clients toute la journée.</p>"
+            "<p>Vous êtes ici pour apprendre et progresser ensemble.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Accueil personnalisé' in md
+    assert 'Vous êtes ici pour apprendre' in md
+
+
+# ── Repeated-CTA dedup + generic-CTA heuristic ───────────────────────────────
+
+def test_generic_read_more_cta_fully_stripped():
+    """Bare generic 'En savoir plus' widgets are pure noise → removed entirely,
+    while each item's real content is preserved."""
+    items = ''.join(
+        f"<div><h3>Produit {i}</h3><p>Description du produit {i}.</p>"
+        f"<a href='#'>En savoir plus</a></div>" for i in range(8))
+    md = rdtextract.extract(f"<html><body>{items}</body></html>")
+    assert md.lower().count('en savoir plus') == 0   # generic CTA removed
+    for i in range(8):
+        assert f'Description du produit {i}.' in md   # per-item content preserved
+
+
+def test_specific_cta_repeats_deduplicated_not_erased():
+    """A specific (non-generic) repeated CTA is deduped to one, not erased."""
+    items = ''.join(
+        f"<div><h3>École {i}</h3><p>Description {i}.</p>"
+        f"<p>RDV sur le site de l'école</p></div>" for i in range(6))
+    md = rdtextract.extract(f"<html><body>{items}</body></html>")
+    assert md.lower().count("rdv sur le site de l'école") == 1
+
+
+def test_standalone_read_more_stripped():
+    html = ("<html><body>"
+            "<article><h2>Actu</h2><p>Le corps.</p>"
+            "<a href='#'>Lire la suite</a></article></body></html>")
+    md = rdtextract.extract(html)
+    assert 'lire la suite' not in md.lower()             # read-more gone
+    assert 'Le corps.' in md
+
+
+def test_read_more_heuristic_spares_specific_sentences():
+    html = ("<html><body><p>En savoir plus sur les modalités d'inscription.</p>"
+            "<p>Il reste 3 places disponibles pour l'atelier.</p></body></html>")
+    md = rdtextract.extract(html)
+    assert "En savoir plus sur les modalités" in md   # specific → kept
+    assert "3 places disponibles" in md               # number in a sentence → kept
+
+
+def test_lone_digit_not_stripped():
+    """A standalone number is kept — stripping it ate date fragments / list
+    numbers on the corpus, so the counter-badge heuristic was dropped."""
+    html = "<html><body><p>Mercredi</p><p>1</p><p>JUIN</p><p>04</p></body></html>"
+    md = rdtextract.extract(html)
+    assert '1' in md and '04' in md
+
+
+def test_non_cta_repeats_are_kept():
+    """A repeated noun-phrase label (job title) is NOT a CTA and must survive."""
+    people = ''.join(
+        f"<div><h3>Chercheur {i}</h3><p>Chargé de recherche</p></div>" for i in range(6))
+    md = rdtextract.extract(f"<html><body>{people}</body></html>")
+    assert md.count('Chargé de recherche') == 6
+
+
+def test_consecutive_duplicate_line_collapsed():
+    """An image alt repeated as the very next caption line is collapsed to one."""
+    html = ("<html><body><figure>"
+            "<figcaption>Exposition pédagogique de l'ASNR</figcaption>"
+            "<figcaption>Exposition pédagogique de l'ASNR</figcaption>"
+            "</figure></body></html>")
+    md = rdtextract.extract(html)
+    assert md.count("Exposition pédagogique de l'ASNR") == 1
+
+
+# ── Over-broad 'overlay' junk pattern (content-card false positive) ───────────
+
+def test_overlay_content_card_is_kept():
+    """A content card using an 'overlay' class (hover caption) must NOT be gutted."""
+    html = ("<html><body><main>"
+            "<div class='news-card'><figcaption class='uk-overlay-panel'>"
+            "<h3>Colloque sur le droit européen</h3>"
+            "<p>Un événement scientifique majeur organisé par la faculté.</p>"
+            "</figcaption></div></main></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Colloque sur le droit européen' in md
+    assert 'événement scientifique majeur' in md
+
+
+def test_modal_overlay_still_stripped():
+    """Genuine junk overlays (via their primary word) are still removed."""
+    html = ("<html><body>"
+            "<div class='modal-overlay'>Fenêtre modale à ignorer</div>"
+            "<div class='popup-overlay'>Popup promotionnel</div>"
+            "<main><p>Le contenu réel de la page.</p></main></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Le contenu réel de la page.' in md
+    assert 'Fenêtre modale' not in md
+    assert 'Popup promotionnel' not in md
+
+
+# ── Glued dates (separate styled <span>s) ────────────────────────────────────
+
+def test_glued_date_is_split():
+    html = ("<html><body><p>"
+            "<span>18</span><span>avr.</span><span>2024</span>"
+            "</p><p>Événement du <span>3</span><span>février</span><span>2025</span>.</p>"
+            "</body></html>")
+    md = rdtextract.extract(html)
+    assert '18 avr. 2024' in md
+    assert '3 février 2025' in md
+
+
+def test_date_deglue_does_not_touch_non_dates():
+    html = "<html><body><p>La quantité 12mai500 est un code interne.</p></body></html>"
+    md = rdtextract.extract(html)
+    assert '12mai500' in md   # 500 is not a 4-digit year → untouched
+
+
+# ── Heading nested in a list item → bold (not "- ### X") ─────────────────────
+
+def test_heading_in_list_rendered_as_bold():
+    html = ("<html><body><ul>"
+            "<li><h3>Jean Birnbaum</h3><p>Philosophe et journaliste.</p></li>"
+            "<li><h4>Corinne Maier</h4></li></ul></body></html>")
+    md = rdtextract.extract(html)
+    assert '- ###' not in md and '- ####' not in md
+    assert '**Jean Birnbaum**' in md
+    assert '**Corinne Maier**' in md
+    assert 'Philosophe et journaliste.' in md
+
+
+def test_standalone_heading_still_a_heading():
+    """Headings outside a list are untouched."""
+    html = "<html><body><article><h2>Titre de section</h2><p>Texte.</p></article></body></html>"
+    md = rdtextract.extract(html)
+    assert '## Titre de section' in md
+
+
+# ── Single-column layout tables → paragraphs ─────────────────────────────────
+
+def test_single_column_multirow_table_becomes_paragraphs():
+    html = ("<html><body><table>"
+            "<tr><td></td></tr>"
+            "<tr><td>Premier paragraphe de contenu.</td></tr>"
+            "<tr><td>Deuxième paragraphe distinct.</td></tr>"
+            "</table></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Premier paragraphe de contenu.' in md
+    assert 'Deuxième paragraphe distinct.' in md
+    assert '|' not in md          # no leftover 1-wide table / empty header

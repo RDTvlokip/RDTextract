@@ -15,6 +15,32 @@ HTML→Markdown extractor built for **AI / LLM training corpora** — every byte
 - **`is_low_value_stub()`** filter for paywalls, login walls, skip-link stubs, empty pages.
 - **One required dependency**: `beautifulsoup4`. Optional `[fast]` extra adds `lxml` for 2-3× speed.
 
+## What's new in v0.3.0
+
+Large output-quality release, every change validated on a **205k-page** French
+crawl (10k+ random pages per audit, false-positives verified line-by-line):
+
+- **Recovered lost content** — the over-broad `overlay` junk pattern was silently
+  destroying whole articles on ~3% of pages that use it (news/heritage/HR content,
+  up to +90k chars/page). Validated: 105 pages recovered on 12k, **zero regressions**.
+- **Cleaner Markdown structure** — a heading nested in a list item now renders as
+  bold (`- **Title**`) instead of invalid `- ### Title` (2155→~0 occurrences); a
+  single-column layout table collapses to paragraphs instead of an empty-header
+  1-wide table.
+- **Un-glued dates** — `18avr.2024` → `18 avr. 2024` (day/month/year split across
+  styled `<span>`s), anchored on FR months so non-dates are untouched.
+- **More UI noise removed** — invisible/zero-width characters (ZWSP, BOM, soft
+  hyphen; NBSP→space), standalone action labels (Haut de page, Partager, Imprimer),
+  breadcrumb trails (Accueil / X / Y), broadened skip-link variants, generic
+  read-more CTAs (En savoir plus, Lire la suite), repeated per-item CTAs, and
+  consecutive duplicate captions.
+- **Cookie-banner stubs** flagged by `is_low_value_stub`.
+- **Held the line on false positives** — attempted mega-menu (ALL-CAPS), form-wrapped,
+  display:none and lone-digit strips were **backed out** after large audits showed
+  them eating real content (team rosters, directories, dates).
+
+Test suite **26 → 48**. 100% backward-compatible API.
+
 ## What's new in v0.2.1
 
 Bug-fix + quality release. **v0.2.0 fails to import on Python 3.9** (a `str | None`
@@ -64,7 +90,7 @@ Major release with substantial gains across every metric measured on the **Tranc
 **Tooling**:
 - New `benchmark/find_outliers.py` — classifies suspicious extractions (EMPTY_LARGE / TINY_RATIO / HUGE_RATIO / ARTIFACTS / SPA_NO_FALLBACK) for human review.
 - New `benchmark/compare_outputs.py` — generates side-by-side `.md` outputs of the 4 extractors for any sample of pages.
-- Test suite expanded from **6 → 26 tests** (JSON-LD types, multi-lang, layout-tables, parser detection, robustness + skip-link/punctuation regressions).
+- Test suite expanded from **6 → 48 tests** (JSON-LD types, multi-lang, layout-tables, parser detection, robustness, skip-link/punctuation/overlay/date/heading/table regressions).
 
 **API compatibility**: 100% backward-compatible with v0.1.x. Existing code keeps working; new features are opt-in.
 
@@ -205,7 +231,7 @@ Custom walker (no `markdownify` dependency) avoids ~50% of buggy edge cases that
 
 ```bash
 pip install -e ".[dev,benchmark]"
-pytest -q                          # 26 tests
+pytest -q                          # 48 tests
 python benchmark/fetch.py --top 1000   # download HTML cache
 python benchmark/run.py            # 4-extractor comparison
 python benchmark/find_outliers.py  # find pages where extraction is suspect

@@ -39,6 +39,28 @@ class MarkdownConverter:
         'header', 'footer', 'nav', 'aside',
     })
 
+    # Day + FR month (full or abbreviated, optional trailing dot) + 4-digit year,
+    # tolerant of missing spaces. Full names precede abbreviations in the
+    # alternation so "avril" wins over "avr". Groups: (day)(month)(dot?)(year).
+    _DATE_GLUE_RE = re.compile(
+        r'(\b\d{1,2}) ?'
+        r'(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|'
+        r'septembre|octobre|novembre|décembre|decembre|'
+        r'janv|févr|fevr|fév|fev|avr|juil|juill|sept|sep|oct|nov|déc|dec)'
+        r'(\.?) ?(\d{4}\b)',
+        re.IGNORECASE,
+    )
+
+    # Invisible / format characters → removed (None) or folded to a plain space.
+    _INVISIBLE_TRANS = {
+        0x00A0: ' ', 0x2007: ' ', 0x2009: ' ', 0x202F: ' ',  # nbsp, figure, thin, narrow-nbsp
+        0x2002: ' ', 0x2003: ' ', 0x2008: ' ', 0x205F: ' ',  # en/em/punct/math spaces
+        0x200B: None, 0x200C: None, 0x200D: None, 0x2060: None, 0xFEFF: None,  # zero-width, WJ, BOM
+        0x00AD: None,                                          # soft hyphen
+        0x200E: None, 0x200F: None,                            # LRM / RLM
+        0x202A: None, 0x202B: None, 0x202C: None, 0x202D: None, 0x202E: None,  # bidi embeddings
+    }
+
     @classmethod
     def to_markdown(cls, cleaned_html: str) -> str:
         """Convert HTML (ideally pre-cleaned) to Markdown."""
@@ -49,6 +71,12 @@ class MarkdownConverter:
             soup = BeautifulSoup(cleaned_html, PARSER)
             root = soup.find('body') or soup
             text = cls._render(root, list_indent=0)
+
+            # Normalise invisible/format characters that pollute a text corpus:
+            # zero-width spaces/joiners, BOM, soft hyphens and bidi marks are
+            # removed; exotic space variants (NBSP, narrow/thin) become a plain
+            # space so the whitespace-collapse below can do its job.
+            text = text.translate(cls._INVISIBLE_TRANS)
 
             # Stash code blocks before whitespace cleanup (preserves indentation).
             placeholders: list[str] = []
@@ -77,20 +105,29 @@ class MarkdownConverter:
             text = re.sub(r'(\S) +([)\]…])', r'\1\2', text)     # " )" " ]" " …"
             text = re.sub(r'(\S) +\.\.\.', r'\1...', text)      # " ..." (ellipsis)
 
+            # Un-glue dates whose day/month/year sit in separate styled <span>s
+            # with no whitespace between them ("18avr.2024" → "18 avr. 2024").
+            # Anchored on a 1-2 digit day + FR month + 4-digit year, so it fires
+            # only on real dates, never on prose.
+            text = cls._DATE_GLUE_RE.sub(r'\1 \2\3 \4', text)
+
             # Strip lines containing only orphan punctuation.
             text = re.sub(r'^[ \t]*[-.>·][ \t]*$', '', text, flags=re.MULTILINE)
             # Strip lines containing only a bare URL (canonical/logo href leaks).
             text = re.sub(r'^[ \t]*https?://\S+[ \t]*$', '', text, flags=re.MULTILINE)
-            # Strip accessibility skip-links ("Aller au contenu", "Skip to
-            # content", "Ignorer pour aller au contenu", skip-nav bars) that leak
-            # in as the first line on ~20% of pages — pure UI noise.
-            text = cls._strip_skip_links(text)
+            # Strip standalone UI noise: accessibility skip-links ("Aller au
+            # contenu", "Skip to content", skip-nav bars) and action labels
+            # ("Haut de page", "Partager", "Imprimer") — pure interface chrome.
+            text = cls._strip_ui_lines(text)
+            text = cls._strip_breadcrumbs(text)
             text = re.sub(r'\n{3,}', '\n\n', text)
 
             for i, code in enumerate(placeholders):
                 text = text.replace(f'\x00CODEBLOCK{i}\x00', code)
 
             text = cls._dedup_consecutive_blocks(text)
+            text = cls._dedup_consecutive_lines(text)
+            text = cls._dedup_repeated_ctas(text)
             text = cls._dedup_global_blocks(text)
             text = text.strip()
 
@@ -122,12 +159,20 @@ class MarkdownConverter:
             'cet article est réservé',
             'connectez-vous pour', 'connectez-vous à votre compte',
             'créer un compte pour',
+            # Cookie-consent banners that leak as the whole (short) output.
+            'nous utilisons des cookies', 'ce site utilise des cookies',
+            'ce site web utilise des cookies', 'en poursuivant votre navigation',
+            'accepter les cookies', 'gérer mes cookies', 'gérer les cookies',
+            'accepter et fermer', 'dépôt de cookies',
         ),
         'en': (
             'subscribers only', 'subscribe to read', 'subscribe to continue reading',
             'this article is for subscribers', 'already a subscriber',
             'sign in to continue', 'log in to continue', 'please sign in',
             'create an account to', 'register to read',
+            # Cookie-consent banners.
+            'we use cookies', 'this website uses cookies', 'this site uses cookies',
+            'accept all cookies', 'manage cookies', 'by continuing to browse',
         ),
         'es': (
             'solo para suscriptores', 'suscríbete para leer', 'contenido exclusivo para suscriptores',
@@ -356,15 +401,99 @@ class MarkdownConverter:
             out.append(block)
         return '\n\n'.join(out)
 
+    # ── Breadcrumb / caption / repeated-CTA / mega-menu cleanup ──────────────
+
+    _BREADCRUMB_HOME = ('accueil', 'home', 'inicio', 'startseite')
+    _BREADCRUMB_SEPS = (' / ', ' > ', ' › ', ' » ', ' — ', ' | ', ' \\ ')
+
+    @classmethod
+    def _strip_breadcrumbs(cls, text: str) -> str:
+        """Drop breadcrumb trails ("Accueil / X / Y", "Vous êtes ici : …")."""
+        out = []
+        for line in text.split('\n'):
+            s = line.strip()
+            low = s.lower()
+            if low:
+                # "Vous êtes ici" / "You are here" labels (need a trail marker so
+                # a real sentence starting that way is not eaten).
+                if (low.startswith(('vous êtes ici', 'you are here', 'tu es aquí'))
+                        and (':' in low or any(sep in s for sep in cls._BREADCRUMB_SEPS))):
+                    continue
+                # "Accueil <sep> … <sep> …" trails.
+                fw = low.split(' ', 1)[0].rstrip(':')
+                if (fw in cls._BREADCRUMB_HOME and len(s) < 200
+                        and any(sep in s for sep in cls._BREADCRUMB_SEPS)):
+                    continue
+            out.append(line)
+        return '\n'.join(out)
+
+    @staticmethod
+    def _dedup_consecutive_lines(text: str, min_len: int = 15) -> str:
+        """Drop a line identical to the previous non-blank one (alt+caption dups)."""
+        out = []
+        prev = None
+        for line in text.split('\n'):
+            s = line.strip()
+            if s and s == prev and len(s) >= min_len:
+                continue
+            out.append(line)
+            if s:
+                prev = s
+        return '\n'.join(out)
+
+    # Clear call-to-action openers. A short CTA line repeated many times is a
+    # per-item widget ("RDV sur le site" ×14); noun-phrase repeats (job titles,
+    # dates) don't match these, so they survive.
+    _CTA_MARKERS = (
+        'rdv', 'rendez-vous sur', 'en savoir plus', 'en savoir +', 'lire la suite',
+        'lire plus', 'voir plus', 'voir le', 'voir la', 'voir les', 'voir tout',
+        'voir toute', 'voir l', 'découvrir', 'je découvre', 'télécharger',
+        'réserver', "s'inscrire", "je m'inscris", 'consulter', 'commander',
+        'ajouter au panier', 'acheter', "plus d'infos", "plus d'informations",
+        'nous contacter', 'contactez-nous', 'demander un devis', 'prendre rendez-vous',
+        'je participe', 'participer', 'en savoir', 'read more', 'learn more',
+        'see more', 'discover', 'download', 'book now', 'sign up', 'add to cart',
+    )
+
+    @classmethod
+    def _dedup_repeated_ctas(cls, text: str, min_repeat: int = 4, max_len: int = 60) -> str:
+        """Keep first, drop repeats of a short CTA line seen ≥min_repeat times."""
+        lines = text.split('\n')
+
+        def cta_key(s):
+            if not s or len(s) > max_len:
+                return None
+            low = s.lower().strip('*_ ').strip()
+            if any(low.startswith(m) or low == m for m in cls._CTA_MARKERS):
+                return s.lower()
+            return None
+
+        keys = [cta_key(l.strip()) for l in lines]
+        counts = Counter(k for k in keys if k)
+        repeated = {k for k, n in counts.items() if n >= min_repeat}
+        if not repeated:
+            return text
+        seen = set()
+        out = []
+        for line, k in zip(lines, keys):
+            if k in repeated:
+                if k in seen:
+                    continue
+                seen.add(k)
+            out.append(line)
+        return '\n'.join(out)
+
     # Accessibility skip-links: screen-reader shortcuts that carry no training
     # value. A line is dropped when it *starts with* one of these (word-boundary
     # anchored, so "Comment aller au contenu du coffre" is NOT a skip-link), or
     # starts with a filler verb and contains one, subject to a length/nav guard.
     _SKIP_LINK_CORES = (
-        'aller au contenu', 'aller au menu', 'aller à la navigation',
-        'aller directement au contenu', 'accéder au contenu', 'accéder directement au contenu',
+        'aller au contenu', 'aller au menu', 'aller au texte', 'aller aux onglets',
+        'aller à la navigation', 'aller directement au contenu',
+        'accéder au contenu', 'accéder directement au contenu',
         'passer au contenu', 'passer directement au contenu',
-        'skip to main content', 'skip to content', 'skip navigation',
+        'skip to main content', 'skip to content', 'skip to the content',
+        'skip to the main content', 'skip to accessibility', 'skip navigation',
         'skip to navigation', 'jump to content', 'jump to navigation',
         'saltar al contenido', 'ir al contenido',
         'zum inhalt springen', 'zum hauptinhalt springen', 'direkt zum inhalt',
@@ -373,45 +502,92 @@ class MarkdownConverter:
     _SKIP_LINK_FILLERS = ('ignorer ', 'passer ', 'cliquez ', 'sauter ', 'aller directement ')
     # Verb-phrases that open a skip-link. ≥3 of them on one line = a concatenated
     # skip-nav bar ("Aller au contenu Aller au menu Aller à la recherche …"),
-    # which we drop regardless of length.
+    # dropped regardless of length even when it doesn't begin with a known core.
     _SKIP_LINK_VERBS = (
-        'aller au', 'aller à', 'skip to', 'passer au', 'passer à',
+        'aller au', 'aller à', 'aller aux', 'skip to', 'passer au', 'passer à',
         'accéder au', 'accéder à', 'saltar al', 'ir al', 'vai al', 'zum ',
     )
-    # Every skip-link/filler above begins with one of these words. Gating on the
-    # (cheaply lowercased) first token lets us skip the full-line .lower() +
-    # startswith work on the ~99.9% of lines that can't be skip-links. It is a
-    # strict superset of the match set, so behaviour is unchanged.
-    _SKIP_LINK_FIRST_WORDS = frozenset({
+    # Destinations a skip-link points at. Requiring one on the concatenated-bar
+    # path keeps real sentences ("aller au marché, aller à la plage…") safe.
+    _SKIP_LINK_DESTS = (
+        'contenu', 'content', 'menu', 'navigation', 'recherche', 'texte',
+        'onglets', 'pied de page', 'en-tête', 'accessibilit', 'inhalt', 'contenido',
+    )
+    # Standalone UI action labels (share / print / back-to-top). Dropped only
+    # when they are the *entire* line, so real prose is never touched.
+    _UI_NOISE_EXACT = frozenset({
+        'haut de page', 'retour en haut', 'retour en haut de page', 'remonter',
+        'revenir en haut', 'back to top', 'top of page',
+        'imprimer', 'imprimer cette page', 'imprimer la page', 'version imprimable',
+        'partager', 'partager cette page', 'partager sur facebook', 'partager sur twitter',
+        'partager sur linkedin', 'partager sur x', 'partager par mail', 'partager par email',
+        'tweeter', 'envoyer par mail', 'envoyer par email', 'envoyer à un ami',
+        'envoyer cette page', "retour à l'accueil", 'retour à l’accueil',
+    })
+    # First tokens that gate the (cheap) fast-path: every skip-link, filler and
+    # UI-noise label above begins with one of these words. Superset of the match
+    # set, so behaviour is unchanged — just avoids lowercasing every line.
+    _UI_FIRST_WORDS = frozenset({
         'aller', 'skip', 'passer', 'accéder', 'ignorer', 'cliquez', 'sauter',
         'jump', 'saltar', 'ir', 'zum', 'vai', 'direkt',
+        'haut', 'retour', 'remonter', 'revenir', 'back', 'top',
+        'imprimer', 'version', 'partager', 'tweeter', 'envoyer',
     })
+    # Heuristic for standalone UI micro-noise: a *whole* short line that is a
+    # generic "read more" call-to-action. Once URLs are dropped it carries no
+    # information. Kept to a small, stable stem set (unlike the exhaustive skip
+    # lists) and applied only to whole lines, so "En savoir plus sur le concours"
+    # (a real, specific sentence) is untouched.
+    _READ_MORE_RE = re.compile(
+        r'^(?:en savoir (?:plus|\+|davantage)|lire (?:la suite|plus|l[\'’]article)|'
+        r'voir (?:plus|tout|la suite|le détail|les? offres?)|tout (?:voir|lire)|'
+        r'en lire plus|lire aussi|read more|learn more|see more|discover more|show more)$'
+    )
 
     @classmethod
-    def _strip_skip_links(cls, text: str) -> str:
-        """Remove standalone accessibility skip-link lines (see _SKIP_LINK_CORES)."""
+    def _strip_ui_lines(cls, text: str) -> str:
+        """Remove standalone skip-links and UI-action labels (see the constants)."""
         if not text:
             return text
         cores = cls._SKIP_LINK_CORES
-        first_words = cls._SKIP_LINK_FIRST_WORDS
+        first_words = cls._UI_FIRST_WORDS
+        ui_exact = cls._UI_NOISE_EXACT
         out = []
         for line in text.split('\n'):
             stripped = line.lstrip()
             if stripped:
+                # Heuristic pass on short whole lines: strip generic read-more
+                # CTAs, which carry no information once URLs are dropped. (A lone
+                # digit was also tried but a 10k audit showed it eats date
+                # fragments like "04"←"JUIN" and numbered lists, so it was dropped.)
+                ls = stripped.rstrip()
+                if len(ls) <= 25:
+                    core = ls.strip('*_ #>»«•·→⭢–—-').strip()
+                    if cls._READ_MORE_RE.match(core.lower()):
+                        continue
                 sp = stripped.find(' ')
                 first = (stripped if sp < 0 else stripped[:sp]).lower()
                 if first in first_words:
                     norm = stripped.rstrip().lower()
+                    # UI-action label as the whole line.
+                    if norm in ui_exact:
+                        continue
+                    # Skip-link: starts with a core, or a filler + contains a core,
+                    # or a concatenated nav bar (≥3 skip verb-phrases).
+                    verbs = sum(norm.count(v) for v in cls._SKIP_LINK_VERBS)
                     is_skip = norm.startswith(cores) or (
                         norm.startswith(cls._SKIP_LINK_FILLERS) and any(c in norm for c in cores)
                     )
-                    # Drop when: short UI string, an unmistakable skip-nav bar
-                    # (pipe/chevron separated), or a run of ≥3 skip verb-phrases.
                     if is_skip and (
-                        len(norm) <= 60
-                        or '|' in norm or '›' in norm or '·' in norm
-                        or sum(norm.count(v) for v in cls._SKIP_LINK_VERBS) >= 3
+                        len(norm) <= 60 or '|' in norm or '›' in norm or '·' in norm or verbs >= 3
                     ):
+                        continue
+                    # Concatenated skip-nav bar that doesn't open with a known core
+                    # ("Skip to accessibility … Aller au contenu principal …").
+                    # Guarded by a skip destination so real sentences that merely
+                    # chain "aller au …" verbs aren't dropped.
+                    if (verbs >= 3 and first in ('skip', 'aller', 'passer', 'accéder')
+                            and any(d in norm for d in cls._SKIP_LINK_DESTS)):
                         continue
             out.append(line)
         return '\n'.join(out)
@@ -473,9 +649,16 @@ class MarkdownConverter:
             return ''
 
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-            level = int(name[1])
             text = cls._inline(node, depth).strip()
-            return f"\n\n{'#' * level} {text}\n\n" if text else ''
+            if not text:
+                return ''
+            # A heading nested in a list item is not a document heading — it is a
+            # styled item title. Rendering it as "### X" produces invalid
+            # "- ### X" markdown, so emit bold inline instead.
+            if node.find_parent('li'):
+                return f"**{text}**"
+            level = int(name[1])
+            return f"\n\n{'#' * level} {text}\n\n"
 
         if name == 'p':
             text = cls._inline(node, depth).strip()
@@ -683,11 +866,13 @@ class MarkdownConverter:
         if ncols == 0:
             return ''
 
-        # Single non-empty cell → render as plain paragraph, not a 1×1 table
-        # (WordPress "info box" pattern: <table><tr><td>caption</td></tr></table>).
-        if ncols == 1 and len(rows) == 1:
-            cell = rows[0][0].strip()
-            return f'\n\n{cell}\n\n' if cell else ''
+        # A single-column table is almost always a layout table (borderless
+        # wrapper, "info box", stacked paragraphs) rather than tabular data.
+        # Render each non-empty cell as its own paragraph instead of emitting a
+        # 1-wide table with an empty "| --- |" header.
+        if ncols == 1:
+            cells = [r[0].strip() for r in rows if r[0].strip()]
+            return '\n\n' + '\n\n'.join(cells) + '\n\n' if cells else ''
 
         lines = ['| ' + ' | '.join(rows[0]) + ' |']
         lines.append('|' + '|'.join([' --- '] * ncols) + '|')

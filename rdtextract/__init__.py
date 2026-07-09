@@ -5,7 +5,7 @@ from __future__ import annotations
 from rdtextract.cleaner import HTMLCleaner
 from rdtextract.converter import MarkdownConverter
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 def _detect_parser() -> str:

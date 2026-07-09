@@ -21,7 +21,7 @@ class HTMLCleaner:
     _JUNK_PATTERNS = {
         'nav', 'navbar', 'menu', 'sidebar', 'footer', 'header',
         'breadcrumb', 'cookie', 'consent', 'banner', 'popup',
-        'modal', 'overlay', 'ad', 'ads', 'advert', 'advertisement',
+        'modal', 'ad', 'ads', 'advert', 'advertisement',
         'social', 'share', 'sharing', 'comment', 'comments',
         'related', 'recommended', 'newsletter', 'subscribe',
         # 'widget' seul est trop large : matche elementor-widget-wrap,
@@ -29,6 +29,13 @@ class HTMLCleaner:
         # de page sur les CMS WordPress modernes. On garde uniquement les
         # variantes spécifiques de "zone widget" (sidebar / footer widget area).
         'widget-area', 'wp-widget-area', 'widgets-area',
+        # 'overlay' seul est trop large aussi : de nombreux thèmes (Joomla Helix,
+        # cartes d'actualités) l'emploient pour un effet de survol/légende sur du
+        # VRAI contenu. Les overlays réellement parasites sont déjà couverts par
+        # leur mot principal ('modal-overlay'→modal, 'popup-overlay'→popup,
+        # 'cookie-overlay'→cookie, 'nav-overlay'→nav) et les backdrops génériques
+        # sont vides donc retirés par le nettoyage des éléments vides.
+        'modal-overlay', 'popup-overlay', 'search-overlay', 'menu-overlay',
         'toolbar', 'pagination',
     }
 

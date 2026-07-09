@@ -132,9 +132,14 @@ Use `python benchmark/compare_outputs.py` to generate side-by-side comparisons o
 
 ### Performance
 
-- **107 ms/page** on average (with `[fast]` extra installed — `lxml` backend)
-- **152 ms/page** without `lxml` (pure-Python `html.parser`)
-- Roughly 2-3× slower than `html2text` (we filter + walk + dedup more aggressively), but produces **zero artifacts** vs html2text's 2 592.
+Measured on the full 672-page benchmark (single pass; figures are
+machine-dependent):
+
+- **~115 ms/page** with the `[fast]` extra (`lxml` backend)
+- **~135 ms/page** without `lxml` (pure-Python `html.parser`) — only ~1.2× slower,
+  because most of the time is the Markdown walker, not the parser
+- Roughly 3× slower than `html2text` (~40 ms/page): we filter + walk + dedup far
+  more aggressively, but produce **zero artifacts** vs html2text's 2 592.
 
 ## API
 

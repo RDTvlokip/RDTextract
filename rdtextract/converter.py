@@ -378,26 +378,41 @@ class MarkdownConverter:
         'aller au', 'aller à', 'skip to', 'passer au', 'passer à',
         'accéder au', 'accéder à', 'saltar al', 'ir al', 'vai al', 'zum ',
     )
+    # Every skip-link/filler above begins with one of these words. Gating on the
+    # (cheaply lowercased) first token lets us skip the full-line .lower() +
+    # startswith work on the ~99.9% of lines that can't be skip-links. It is a
+    # strict superset of the match set, so behaviour is unchanged.
+    _SKIP_LINK_FIRST_WORDS = frozenset({
+        'aller', 'skip', 'passer', 'accéder', 'ignorer', 'cliquez', 'sauter',
+        'jump', 'saltar', 'ir', 'zum', 'vai', 'direkt',
+    })
 
     @classmethod
     def _strip_skip_links(cls, text: str) -> str:
         """Remove standalone accessibility skip-link lines (see _SKIP_LINK_CORES)."""
+        if not text:
+            return text
         cores = cls._SKIP_LINK_CORES
+        first_words = cls._SKIP_LINK_FIRST_WORDS
         out = []
         for line in text.split('\n'):
-            norm = line.strip().lower()
-            if norm:
-                is_skip = norm.startswith(cores) or (
-                    norm.startswith(cls._SKIP_LINK_FILLERS) and any(c in norm for c in cores)
-                )
-                # Drop when: short UI string, an unmistakable skip-nav bar
-                # (pipe/chevron separated), or a run of ≥3 skip verb-phrases.
-                if is_skip and (
-                    len(norm) <= 60
-                    or '|' in norm or '›' in norm or '·' in norm
-                    or sum(norm.count(v) for v in cls._SKIP_LINK_VERBS) >= 3
-                ):
-                    continue
+            stripped = line.lstrip()
+            if stripped:
+                sp = stripped.find(' ')
+                first = (stripped if sp < 0 else stripped[:sp]).lower()
+                if first in first_words:
+                    norm = stripped.rstrip().lower()
+                    is_skip = norm.startswith(cores) or (
+                        norm.startswith(cls._SKIP_LINK_FILLERS) and any(c in norm for c in cores)
+                    )
+                    # Drop when: short UI string, an unmistakable skip-nav bar
+                    # (pipe/chevron separated), or a run of ≥3 skip verb-phrases.
+                    if is_skip and (
+                        len(norm) <= 60
+                        or '|' in norm or '›' in norm or '·' in norm
+                        or sum(norm.count(v) for v in cls._SKIP_LINK_VERBS) >= 3
+                    ):
+                        continue
             out.append(line)
         return '\n'.join(out)
 

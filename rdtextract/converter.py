@@ -229,6 +229,62 @@ class MarkdownConverter:
         return any(m in lower for m in markers)
 
     @classmethod
+    def strip_site_boilerplate(cls, markdowns, *, threshold: float = 0.6,
+                               min_pages: int = 5, min_unique_chars: int = 400):
+        """Remove cross-page boilerplate from a batch of pages of the SAME site.
+
+        Whatever text repeats on ≥`threshold` of a site's pages (nav, footer,
+        cookie banners, mega-menus, per-item CTAs) is template chrome that no
+        single-page rule can safely detect. This uses the site's own page set as
+        the signal — no keyword lists.
+
+        Args:
+            markdowns: an iterable of Markdown strings (output of `to_markdown`),
+                one per page of a single site.
+            threshold: a line is boilerplate if it appears on ≥ this fraction of
+                the non-empty pages.
+            min_pages: below this many non-empty pages the frequency signal is
+                unreliable, so nothing is stripped.
+            min_unique_chars: thin-site guard — if a page would keep fewer than
+                this many non-boilerplate characters, it is left untouched. On
+                near-duplicate / templated sites the shared text IS the content,
+                so there is nothing to gain by stripping it.
+
+        Returns:
+            A list of cleaned Markdown strings, aligned with the input order.
+            Markdown headings (lines starting with '#') are preserved to keep
+            per-page structure.
+        """
+        mds = [m if isinstance(m, str) else '' for m in markdowns]
+        nonempty = [m for m in mds if m.strip()]
+        n = len(nonempty)
+        if n < min_pages:
+            return mds
+
+        docfreq = Counter()
+        for m in nonempty:
+            seen = {line.strip() for line in m.split('\n') if len(line.strip()) >= 3}
+            for s in seen:
+                docfreq[s] += 1
+        cutoff = threshold * n
+        boiler = {s for s, c in docfreq.items()
+                  if c >= cutoff and not s.lstrip().startswith('#')}
+        if not boiler:
+            return mds
+
+        out = []
+        for m in mds:
+            if not m.strip():
+                out.append(m)
+                continue
+            kept = [line for line in m.split('\n') if line.strip() not in boiler]
+            cleaned = re.sub(r'\n{3,}', '\n\n', '\n'.join(kept)).strip()
+            # Thin-site guard: a page needs enough unique content left to justify
+            # stripping; otherwise the shared text was the content — keep it.
+            out.append(cleaned if len(cleaned) >= min_unique_chars else m.strip())
+        return out
+
+    @classmethod
     def _extract_jsonld_fallback(cls, soup, min_total_chars: int = 200) -> str:
         """Build markdown from JSON-LD structured data when walker yields empty.
 
@@ -517,7 +573,7 @@ class MarkdownConverter:
     # when they are the *entire* line, so real prose is never touched.
     _UI_NOISE_EXACT = frozenset({
         'haut de page', 'retour en haut', 'retour en haut de page', 'remonter',
-        'revenir en haut', 'back to top', 'top of page',
+        'revenir en haut', 'back to top', 'top of page', 'bottom of page',
         'imprimer', 'imprimer cette page', 'imprimer la page', 'version imprimable',
         'partager', 'partager cette page', 'partager sur facebook', 'partager sur twitter',
         'partager sur linkedin', 'partager sur x', 'partager par mail', 'partager par email',
@@ -530,7 +586,7 @@ class MarkdownConverter:
     _UI_FIRST_WORDS = frozenset({
         'aller', 'skip', 'passer', 'accéder', 'ignorer', 'cliquez', 'sauter',
         'jump', 'saltar', 'ir', 'zum', 'vai', 'direkt',
-        'haut', 'retour', 'remonter', 'revenir', 'back', 'top',
+        'haut', 'retour', 'remonter', 'revenir', 'back', 'top', 'bottom',
         'imprimer', 'version', 'partager', 'tweeter', 'envoyer',
     })
     # Heuristic for standalone UI micro-noise: a *whole* short line that is a

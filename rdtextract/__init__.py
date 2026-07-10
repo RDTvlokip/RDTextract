@@ -5,7 +5,7 @@ from __future__ import annotations
 from rdtextract.cleaner import HTMLCleaner
 from rdtextract.converter import MarkdownConverter
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 def _detect_parser() -> str:
@@ -25,6 +25,7 @@ __all__ = [
     "clean_html",
     "to_markdown",
     "extract",
+    "extract_site",
     "is_low_value_stub",
 ]
 
@@ -42,6 +43,23 @@ def to_markdown(cleaned_html: str) -> str:
 def extract(html: str) -> str:
     """One-shot: clean raw HTML then convert to Markdown."""
     return MarkdownConverter.to_markdown(HTMLCleaner.clean_html(html))
+
+
+def extract_site(htmls, **kwargs) -> list[str]:
+    """Extract many pages of the SAME site, then remove cross-page boilerplate.
+
+    Pass every page you have for one site; text that repeats across the site
+    (nav, footer, mega-menus, cookie banners, per-item CTAs) is detected from
+    the page set itself — no keyword lists — and stripped, while a thin-site
+    guard protects near-duplicate pages. Returns Markdown strings in input order.
+
+    >>> pages = extract_site([html1, html2, html3])   # all from example.com
+
+    Keyword args are forwarded to `MarkdownConverter.strip_site_boilerplate`
+    (`threshold`, `min_pages`, `min_retained`, `min_retained_chars`).
+    """
+    mds = [extract(h) for h in htmls]
+    return MarkdownConverter.strip_site_boilerplate(mds, **kwargs)
 
 
 def is_low_value_stub(markdown: str, language: str | None = None) -> bool:

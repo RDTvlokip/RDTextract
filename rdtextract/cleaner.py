@@ -39,6 +39,18 @@ class HTMLCleaner:
         'toolbar', 'pagination',
     }
 
+    # Containers of popular cookie-consent plugins (WordPress + JS). Their class
+    # names glue the word "cookie" (cmplz-cookiebanner) so the plain 'cookie'
+    # pattern misses them, and a long banner on a short page survives the ratio
+    # guard. These identifiers are unambiguous chrome → stripped unconditionally.
+    _COOKIE_BANNER_RE = re.compile(
+        r'(?:cmplz-cookiebanner|cmplz-manage-consent|cli-modal|cli-bar-popup|'
+        r'moove_gdpr|moove-gdpr|borlabs-cookie|tarteaucitron|axeptio|didomi-'
+        r'|onetrust-banner|onetrust-consent|ot-sdk-container|iubenda-cs|'
+        r'cookie-?consent|cookie-?notice|cookie-?law-info|gdpr-?cookie|cc-window)',
+        re.IGNORECASE,
+    )
+
     # Word-boundary regex to avoid false positives (e.g. 'ad' in 'leading-relaxed').
     _JUNK_RE = re.compile(
         r'\b(?:' + '|'.join(re.escape(p) for p in _JUNK_PATTERNS) + r')\b',
@@ -52,6 +64,27 @@ class HTMLCleaner:
         'strong', 'em', 'b', 'i', 'a', 'span', 'br', 'hr', 'img',
         'time', 'address', 'mark', 'abbr', 'cite', 'q', 'sub', 'sup',
     }
+
+    @staticmethod
+    def _wraps_article_title(tag) -> bool:
+        """True if `tag` wraps an article-title <h1> — a header/container we must
+        NOT strip. Common CMS pattern (<header class="entry-header"><h1
+        class="entry-title">) otherwise gets decomposed as chrome, silently
+        losing the page title on ~1/3 of article pages."""
+        for h in tag.find_all(['h1', 'h2'], limit=4):
+            cls = ' '.join(h.get('class', [])).lower()
+            if (h.get('itemprop') == 'headline'
+                    or 'entry-title' in cls or 'post-title' in cls
+                    or 'article-title' in cls or 'entry-header' in cls
+                    or h.find_parent('article') is not None):
+                return True
+        # A bare page-title header (<header><h1>Title</h1></header>) with no <nav>
+        # and few links is a page title, not the site masthead (which carries a
+        # nav menu and many links).
+        if tag.name in ('header', 'hgroup') and tag.find('h1') is not None \
+                and tag.find('nav') is None and len(tag.find_all('a')) <= 2:
+            return True
+        return False
 
     @classmethod
     def _is_junk_element(cls, tag) -> bool:
@@ -137,6 +170,17 @@ class HTMLCleaner:
             if not body:
                 body = soup
 
+            # Known cookie-consent plugin containers are ALWAYS chrome, whatever
+            # their size — remove them unconditionally (the generic size/ratio
+            # guards otherwise keep a long banner on short pages, e.g. Complianz
+            # whose 'cmplz-*' classes don't match the plain 'cookie' pattern).
+            for tag in list(body.find_all(class_=HTMLCleaner._COOKIE_BANNER_RE)):
+                if tag.parent is not None:
+                    tag.decompose()
+            for tag in list(body.find_all(id=HTMLCleaner._COOKIE_BANNER_RE)):
+                if tag.parent is not None:
+                    tag.decompose()
+
             # Decompose junk tags. For structural semantic tags, apply a size
             # guard: malformed HTML (unclosed <header>/<nav>) makes lxml strictly
             # nest the whole body inside one of these — decomposing it would gut
@@ -147,8 +191,17 @@ class HTMLCleaner:
             for tag in body.find_all(list(HTMLCleaner._JUNK_TAGS)):
                 if tag.parent is None:
                     continue
-                if tag.name in _STRUCTURAL and len(tag.get_text(strip=True)) > _STRUCTURAL_KEEP_THRESHOLD:
-                    continue  # likely malformed HTML wrapping real content
+                if tag.name in _STRUCTURAL:
+                    if len(tag.get_text(strip=True)) > _STRUCTURAL_KEEP_THRESHOLD:
+                        continue  # likely malformed HTML wrapping real content
+                    if HTMLCleaner._wraps_article_title(tag):
+                        continue  # e.g. <header class="entry-header"> holds the title
+                # A <label> wrapping a heading is a CSS-accordion trigger holding a
+                # real question/title (FAQ pattern), not a form-field label —
+                # unwrap it so the heading survives instead of being decomposed.
+                if tag.name == 'label' and tag.find(['h2', 'h3', 'h4', 'h5', 'h6']):
+                    tag.unwrap()
+                    continue
                 tag.decompose()
 
             # Strip icon fonts (Material Symbols/Icons, FontAwesome, Glyphicons)
@@ -206,6 +259,10 @@ class HTMLCleaner:
                 if tag.parent is None:
                     continue
                 if HTMLCleaner._is_junk_element(tag):
+                    # Never strip a container that holds the article title
+                    # (e.g. class="entry-header" matches the 'header' pattern).
+                    if HTMLCleaner._wraps_article_title(tag):
+                        continue
                     text_len = len(tag.get_text(strip=True))
                     # Structural tag avec gros contenu = HTML malformé
                     if tag.name in _STRUCTURAL and text_len > _STRUCTURAL_KEEP_THRESHOLD:

@@ -501,3 +501,125 @@ def test_single_column_multirow_table_becomes_paragraphs():
     assert 'Premier paragraphe de contenu.' in md
     assert 'Deuxième paragraphe distinct.' in md
     assert '|' not in md          # no leftover 1-wide table / empty header
+
+
+# ── extract_site(): cross-page boilerplate removal ───────────────────────────
+
+# A promotional block in a plain <div> survives single-page cleaning (it is not
+# nav/footer/junk-classed) — only cross-page frequency can identify it as chrome.
+_SHARED = ("<div><p>Suivez-nous sur les réseaux sociaux et téléchargez notre "
+           "application mobile disponible partout.</p></div>")
+
+
+def _site_pages(bodies):
+    return [f"<html><body><main>{_SHARED}{b}</main></body></html>" for b in bodies]
+
+
+def test_extract_site_strips_shared_block_single_page_keeps_it():
+    bodies = [f"<h1>Article {i}</h1><p>{'Contenu unique et substantiel numéro %d. ' % i * 20}</p>"
+              for i in range(8)]
+    pages = _site_pages(bodies)
+    # single-page extraction cannot know the block is chrome → it survives
+    assert 'Suivez-nous sur les réseaux sociaux' in rdtextract.extract(pages[0])
+    out = rdtextract.extract_site(pages)
+    assert len(out) == 8
+    for i, md in enumerate(out):
+        assert f'Contenu unique et substantiel numéro {i}.' in md   # unique kept
+    assert 'Suivez-nous sur les réseaux sociaux' not in '\n'.join(out)  # shared removed
+
+
+def test_extract_site_thin_site_guard_preserves_pages():
+    """Near-identical pages (thin site): the shared text IS the content → kept."""
+    bodies = ["<h2>Bienvenue</h2><p>Horaires: 9h-12h.</p>"] * 6
+    pages = _site_pages(bodies)
+    solo = [rdtextract.extract(p) for p in pages]
+    out = rdtextract.extract_site(pages)
+    assert out == solo           # guard leaves every page untouched
+
+
+def test_extract_site_below_min_pages_is_noop():
+    bodies = [f"<h1>Page {i}</h1><p>Texte {i}.</p>" for i in range(3)]
+    pages = _site_pages(bodies)
+    solo = [rdtextract.extract(p) for p in pages]
+    assert rdtextract.extract_site(pages, min_pages=5) == solo   # too few pages → no-op
+
+
+def test_extract_site_leaves_single_page_extract_unchanged():
+    html = "<html><body><main><h1>Titre</h1><p>Du contenu.</p></main></body></html>"
+    assert rdtextract.extract(html).strip()   # extract() itself is unaffected
+
+
+# ── Article-title preservation (title was silently lost on ~1/3 of article pages)
+
+def test_wordpress_entry_header_title_kept():
+    """WordPress/Astra pattern: <header class="entry-header"> holds the <h1> title
+    inside <article>. It must not be stripped as chrome."""
+    html = ("<html><body>"
+            "<header id='masthead'><nav><a href='#'>Accueil</a><a href='#'>Contact</a>"
+            "<a href='#'>Blog</a></nav></header>"
+            "<main><article>"
+            "<header class='entry-header'><h1 class='entry-title'>Saisie immobilière : procédure et défense</h1>"
+            "<span class='posted-on'>12 février 2024</span></header>"
+            "<div class='entry-content'><p>Le contenu juridique de l'article.</p></div>"
+            "</article></main></body></html>")
+    md = rdtextract.extract(html)
+    assert '# Saisie immobilière : procédure et défense' in md
+    assert "Le contenu juridique de l'article." in md
+    assert 'Accueil' not in md                      # site masthead nav still stripped
+
+
+def test_h2_entry_title_card_kept():
+    html = ("<html><body><article class='article-summary'>"
+            "<header class='entry-header'><h2 class='entry-title'>La Pharmacie du Grand Siècle</h2></header>"
+            "<p>Résumé de l'article.</p></article></body></html>")
+    md = rdtextract.extract(html)
+    assert 'La Pharmacie du Grand Siècle' in md
+
+
+def test_bare_page_title_header_kept_but_masthead_stripped():
+    # a bare page-title header (no nav, few links) is kept…
+    page = "<html><body><header><h1>Doctorats honoris Causa en France</h1></header><p>Texte.</p></body></html>"
+    assert 'Doctorats honoris Causa en France' in rdtextract.extract(page)
+    # …but a masthead (nav + many links) is still stripped
+    masthead = ("<html><body><header><h1>MonSite</h1>"
+                "<nav><a href='#'>A</a><a href='#'>B</a><a href='#'>C</a><a href='#'>D</a></nav>"
+                "</header><main><p>Contenu de la page.</p></main></body></html>")
+    md = rdtextract.extract(masthead)
+    assert 'MonSite' not in md
+    assert 'Contenu de la page.' in md
+
+
+def test_cookie_plugin_banner_stripped_even_on_short_page():
+    """Complianz & co. banners glue 'cookie' in their class (cmplz-cookiebanner)
+    and are large vs a short article — strip them unconditionally by plugin id."""
+    banner = ("<div id='cmplz-cookiebanner-container'><div class='cmplz-cookiebanner'>"
+              "<div class='cmplz-message'>Nous utilisons des technologies telles que "
+              "les cookies pour stocker des informations. " * 5 + "</div>"
+              "<button class='cmplz-btn'>Accepter</button></div></div>")
+    html = f"<html><body><article><h1>Petit article</h1><p>Corps bref.</p></article>{banner}</body></html>"
+    md = rdtextract.extract(html)
+    assert '# Petit article' in md and 'Corps bref.' in md
+    assert 'cookies pour stocker' not in md
+    assert 'Accepter' not in md
+
+
+def test_faq_accordion_label_question_kept():
+    """CSS-accordion FAQ: <label><h3>Question?</h3></label> + answer. The <label>
+    is a form tag but here wraps the question heading — it must survive."""
+    html = ("<html><body><section><h2>Questions fréquentes</h2>"
+            "<div><input type='checkbox' id='q1'>"
+            "<label for='q1'><h3>Est-ce remboursé par l'assurance ?</h3></label>"
+            "<div><p>Oui, c'est remboursé.</p></div></div>"
+            "</section></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Est-ce remboursé par l'"'"'assurance ?' in md   # question kept
+    assert "Oui, c'est remboursé." in md                    # answer kept
+
+
+def test_plain_form_label_still_stripped():
+    """A genuine form-field label (no heading) is still removed."""
+    html = ("<html><body><main><p>Contenu réel.</p>"
+            "<form><label for='n'>Nom*</label><input id='n'></form></main></body></html>")
+    md = rdtextract.extract(html)
+    assert 'Contenu réel.' in md
+    assert 'Nom*' not in md

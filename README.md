@@ -15,6 +15,31 @@ HTML→Markdown extractor built for **AI / LLM training corpora** — every byte
 - **`is_low_value_stub()`** filter for paywalls, login walls, skip-link stubs, empty pages.
 - **One required dependency**: `beautifulsoup4`. Optional `[fast]` extra adds `lxml` for 2-3× speed.
 
+## What's new in v0.4.0
+
+Content-recovery release + a new batch API. Every fix was found by reading full
+HTML↔Markdown pairs on a 205k-page French crawl, then measured at scale.
+
+- **Article titles no longer lost.** The `<header class="entry-header"><h1
+  class="entry-title">` pattern (WordPress/Astra and most CMS themes) was being
+  stripped as chrome — **31.5 % of article pages silently lost their title**. A
+  new title-preserving guard keeps it (down to ~17 %, the rest being page-labels /
+  site names that *should* drop), while site mastheads are still removed.
+- **FAQ accordion questions kept.** CSS accordions wrap the question heading in a
+  `<label>` (a form tag); it was decomposed, leaving answers without questions.
+  A `<label>` holding a heading is now unwrapped, so the Q&A survives.
+- **Cookie-plugin banners removed even on short pages.** Complianz (`cmplz-*`),
+  Cookie Law Info, Tarteaucitron, OneTrust, Didomi, Axeptio… containers are
+  stripped unconditionally (their class names hide the word "cookie", and a long
+  banner on a short page slipped past the ratio guard).
+- **`extract_site(htmls)` — new API.** Give it every page you have for one site;
+  text that repeats across the site (mega-menus, footers, cookie text, per-item
+  CTAs) is detected from the page set itself — **no keyword lists** — and removed,
+  with a thin-site guard that never guts near-duplicate pages and headings kept.
+  `extract()` (single page) is unchanged.
+
+Test suite **26 → 58**. 100 % backward-compatible.
+
 ## What's new in v0.3.0
 
 Large output-quality release, every change validated on a **205k-page** French
@@ -172,6 +197,19 @@ machine-dependent):
 ### `extract(html: str) -> str`
 Convenience: `to_markdown(clean_html(html))`. The main entry point.
 
+### `extract_site(htmls, *, threshold=0.6, min_pages=5, min_unique_chars=400) -> list[str]`
+Extract **many pages of the same site** and remove cross-page boilerplate. Text
+that appears on ≥`threshold` of the pages (mega-menus, footers, cookie banners,
+per-item CTAs) is detected from the page set itself — no keyword lists — and
+stripped. A thin-site guard leaves a page untouched if fewer than
+`min_unique_chars` non-boilerplate characters would remain (on near-duplicate
+sites the shared text *is* the content); Markdown headings are preserved. Below
+`min_pages` non-empty pages, nothing is stripped. Returns Markdown in input order.
+
+```python
+pages = rdtextract.extract_site([html1, html2, html3])   # all from example.com
+```
+
 ### `clean_html(html: str) -> str`
 Strip nav/footer/scripts/ads/hidden elements. Drops responsive duplicates (mobile/desktop variants), icon font ligatures, role-based junk (`role=navigation`, `role=banner`, …). Preserves `<script type="application/ld+json">` for structured data fallback.
 
@@ -231,7 +269,7 @@ Custom walker (no `markdownify` dependency) avoids ~50% of buggy edge cases that
 
 ```bash
 pip install -e ".[dev,benchmark]"
-pytest -q                          # 48 tests
+pytest -q                          # 58 tests
 python benchmark/fetch.py --top 1000   # download HTML cache
 python benchmark/run.py            # 4-extractor comparison
 python benchmark/find_outliers.py  # find pages where extraction is suspect

@@ -1,0 +1,15 @@
+beautifulsoup4>=4.10
+
+[benchmark]
+trafilatura
+markdownify
+html2text
+lxml>=4.9
+
+[dev]
+pytest>=7.0
+pytest-cov
+lxml>=4.9
+
+[fast]
+lxml>=4.9
